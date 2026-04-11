@@ -1,3 +1,6 @@
 [submodule "rpim_pc"]
 	path = rpim_pc
 	url = https://github.com/aakysank1993/rpim_pc.git
+[submodule "core_data"]
+	path = core_data
+	url = git@github.com:aakysank1993/core_data.git
