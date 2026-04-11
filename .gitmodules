@@ -1,6 +1,3 @@
-[submodule "ecad_parser"]
-	path = ecad_parser
-	url = https://github.com/aakysank1993/ecad_parser.git
 [submodule "rpim_pc"]
 	path = rpim_pc
 	url = https://github.com/aakysank1993/rpim_pc.git
