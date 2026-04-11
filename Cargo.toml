@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "core_data",
-    "step_convertor",
+    "gltf_convertor",
     "rpim_pc"
 ]
 resolver = "2"
