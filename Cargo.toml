@@ -3,5 +3,5 @@ members = [
     "core_data",
     "gltf_convertor",
     "rpim_pc"
-]
+,   "rpim_solver"]
 resolver = "2"

@@ -7,3 +7,6 @@
 [submodule "gltf_convertor"]
 	path = gltf_convertor
 	url = git@github.com:aakysank1993/gltf_convertor.git
+[submodule "rpim_solver"]
+	path = rpim_solver
+	url = https://github.com/aakysank1993/rpim_solver.git
