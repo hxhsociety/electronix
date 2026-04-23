@@ -10,3 +10,6 @@
 [submodule "rpim_solver"]
 	path = rpim_solver
 	url = https://github.com/aakysank1993/rpim_solver.git
+[submodule "frontend"]
+	path = frontend
+	url = https://github.com/aakysank1993/frontend.git
