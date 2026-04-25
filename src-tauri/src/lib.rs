@@ -142,27 +142,10 @@ fn run_streamed(
 
 // ─── commands ────────────────────────────────────────────────────────────────
 
-/// Show a native open-file dialog filtered to .cvg / .xml.
-/// Returns the selected path, or None if cancelled.
-///
-/// blocking_pick_file() dispatches to the UI main thread internally, so it
-/// must run on its own OS thread (not an async executor thread).
-/// spawn_blocking() provides that dedicated thread.
-#[tauri::command]
-async fn pick_file(app: AppHandle) -> Result<Option<String>, String> {
-    use tauri_plugin_dialog::DialogExt;
-
-    let path = tokio::task::spawn_blocking(move || {
-        app.dialog()
-            .file()
-            .add_filter("IPC-2581 board", &["cvg", "xml"])
-            .blocking_pick_file()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-
-    Ok(path.map(|p| p.to_string()))
-}
+// pick_file Rust command removed — file selection is now handled
+// entirely by @tauri-apps/plugin-dialog in the frontend (open() JS API).
+// The tauri_plugin_dialog::init() plugin registration in run() still
+// provides the backend that the JS API calls through.
 
 /// Check whether model.glb exists in the frontend public directory.
 /// Called by App.tsx on startup to decide whether to show the project
@@ -361,7 +344,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            pick_file,
             check_model_exists,
             run_import,
             run_generate_pc,
