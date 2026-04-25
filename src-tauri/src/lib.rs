@@ -144,21 +144,27 @@ fn run_streamed(
 
 /// Show a native open-file dialog filtered to .cvg / .xml.
 /// Returns the selected path, or None if cancelled.
+///
+/// Uses the callback API + a oneshot channel instead of spawn_blocking so the
+/// OS dialog opens immediately without waiting for a blocking-thread-pool slot.
 #[tauri::command]
 async fn pick_file(app: AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
 
-    // blocking_pick_file must be called off the async Tauri thread pool
-    let path = tokio::task::spawn_blocking(move || {
-        app.dialog()
-            .file()
-            .add_filter("IPC-2581 board", &["cvg", "xml"])
-            .blocking_pick_file()
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    let (tx, rx) = oneshot::channel();
 
-    Ok(path.map(|p| p.to_string()))
+    app.dialog()
+        .file()
+        .add_filter("IPC-2581 board", &["cvg", "xml"])
+        .pick_file(move |path| {
+            // Fires on the main thread as soon as the user picks / cancels
+            let _ = tx.send(path);
+        });
+
+    // Await the user's choice without blocking any thread
+    let result = rx.await.map_err(|e| e.to_string())?;
+    Ok(result.map(|p| p.to_string()))
 }
 
 /// Convert a CVG board file to GLB using gltf_convertor.
