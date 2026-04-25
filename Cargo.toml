@@ -2,6 +2,8 @@
 members = [
     "core_data",
     "gltf_convertor",
-    "rpim_pc"
-,   "rpim_solver"]
+    "rpim_pc",
+    "rpim_solver",
+    "src-tauri",
+]
 resolver = "2"

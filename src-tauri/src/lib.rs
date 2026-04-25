@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -190,18 +190,26 @@ async fn run_import(
     Ok(glb_str)
 }
 
+/// Result of run_generate_pc — paths to all output files.
+#[derive(serde::Serialize, Clone)]
+struct GeneratePcResult {
+    pcprep_path:    String,
+    config_path:    String,
+    materials_path: String,
+}
+
 /// Write rpim_input.json to disk then run rpim_pc.
 ///
 /// config_json — serialised PointCloudSettings JSON string
 /// out_dir     — directory for all rpim_pc outputs  (created if absent)
-/// Returns path to the generated .pcprep file.
+/// Returns paths to the generated pcprep / config / materials files.
 #[tauri::command]
 async fn run_generate_pc(
     app: AppHandle,
     cvg_path: String,
     config_json: String,
     out_dir: String,
-) -> Result<String, String> {
+) -> Result<GeneratePcResult, String> {
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Cannot create out_dir: {e}"))?;
 
@@ -217,9 +225,9 @@ async fn run_generate_pc(
     std::fs::write(&json_path, &config_json)
         .map_err(|e| format!("Cannot write rpim_input.json: {e}"))?;
 
-    let out_base    = Path::new(&out_dir).join(&base);
+    let out_base     = Path::new(&out_dir).join(&base);
     let out_base_str = out_base.to_string_lossy().to_string();
-    let json_str    = json_path.to_string_lossy().to_string();
+    let json_str     = json_path.to_string_lossy().to_string();
 
     emit(&app, "generate_pc", "Generating RPIM point cloud…", false, None);
 
@@ -235,8 +243,74 @@ async fn run_generate_pc(
         Some(&log_path),
     )?;
 
-    let pcprep = format!("{out_base_str}.pcprep");
-    Ok(pcprep)
+    Ok(GeneratePcResult {
+        pcprep_path:    format!("{out_base_str}.pcprep"),
+        config_path:    format!("{out_base_str}_rpim_config.json"),
+        materials_path: format!("{out_base_str}_rpim_materials.json"),
+    })
+}
+
+/// Read any text/JSON file from disk and return its contents as a string.
+/// Used by the frontend to load rpim_config.json after point-cloud generation.
+#[tauri::command]
+async fn read_json_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {path}: {e}"))
+}
+
+/// One node from the *PCB_POINT_CLOUD section of a .pcprep file.
+#[derive(serde::Serialize, Clone)]
+struct TraceNode {
+    x:              f32,
+    y:              f32,
+    z:              f32,
+    metal_fraction: f32,
+}
+
+/// Parse the *PCB_POINT_CLOUD section from a .pcprep file.
+/// Returns every line that has four whitespace-separated numbers.
+/// Used by the Material Browser's "Trace Map" view.
+#[tauri::command]
+async fn read_trace_map(pcprep_path: String) -> Result<Vec<TraceNode>, String> {
+    let content = std::fs::read_to_string(&pcprep_path)
+        .map_err(|e| format!("Cannot read {pcprep_path}: {e}"))?;
+
+    let mut nodes: Vec<TraceNode> = Vec::new();
+    let mut in_block = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.eq_ignore_ascii_case("*PCB_POINT_CLOUD")
+            || trimmed.to_ascii_uppercase().starts_with("*PCB_POINT_CLOUD")
+        {
+            in_block = true;
+            continue;
+        }
+
+        if in_block {
+            // A new section header ends the block
+            if trimmed.starts_with('*') {
+                break;
+            }
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 4 {
+                if let (Ok(x), Ok(y), Ok(z), Ok(mf)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                    parts[3].parse::<f32>(),
+                ) {
+                    nodes.push(TraceNode { x, y, z, metal_fraction: mf });
+                }
+            }
+        }
+    }
+
+    Ok(nodes)
 }
 
 /// Run rpim_solver on an existing .pcprep file.
@@ -278,6 +352,8 @@ pub fn run() {
             run_import,
             run_generate_pc,
             run_solver,
+            read_json_file,
+            read_trace_map,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ElectroniX");
