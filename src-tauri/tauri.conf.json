@@ -26,7 +26,12 @@
     ],
     "security": {
       "csp": null
-    }
+    },
+    "withGlobalTauri": true
+  },
+
+  "plugins": {
+    "dialog": {}
   },
 
   "bundle": {

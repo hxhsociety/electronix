@@ -142,28 +142,21 @@ fn run_streamed(
 
 // ─── commands ────────────────────────────────────────────────────────────────
 
-/// Open a native file picker on the main thread (via the callback API) and
-/// emit the result as a "file-picked" event to the frontend.
-///
-/// This approach avoids two failure modes:
-///   • blocking_pick_file() + spawn_blocking  → dispatch deadlock in WebView2
-///   • @tauri-apps/plugin-dialog JS open()   → __TAURI_INTERNALS__ path mismatch
-///
-/// The command returns immediately; the selected path (or null) arrives as
-/// a "file-picked" Tauri event that the frontend awaits with listen().
 #[tauri::command]
-async fn pick_file_emit(app: AppHandle) -> Result<(), String> {
+async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
-
-    let emitter = app.clone();
-    app.dialog()
-        .file()
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    
+    app.dialog().file()
         .add_filter("IPC-2581 board", &["cvg", "xml"])
         .pick_file(move |path| {
-            let _ = emitter.emit("file-picked", path.map(|p| p.to_string()));
+            let res = path.map(|p| p.to_string());
+            let _ = tx.send(res);
         });
-
-    Ok(())   // returns immediately — result arrives via event
+    
+    let result = rx.await.map_err(|e| e.to_string())?;
+    println!("pick_file returning: {:?}", result);
+    Ok(result)
 }
 
 /// Check whether model.glb exists in the frontend public directory.
@@ -363,7 +356,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            pick_file_emit,
+            pick_file,
             check_model_exists,
             run_import,
             run_generate_pc,
