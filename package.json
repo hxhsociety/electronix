@@ -1,0 +1,9 @@
+{
+  "name": "electronix-root",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev":   "frontend\\node_modules\\.bin\\tauri dev",
+    "build": "frontend\\node_modules\\.bin\\tauri build"
+  }
+}
