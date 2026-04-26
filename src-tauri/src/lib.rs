@@ -333,7 +333,7 @@ async fn run_solver(
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Cannot create out_dir: {e}"))?;
 
-    emit(&app, "solver", "Running RPIM thermal + fatigue solver…", false, None);
+    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
 
     let bin = find_bin("rpim_solver")
         .ok_or_else(|| "rpim_solver binary not found".to_string())?;
@@ -350,6 +350,69 @@ async fn run_solver(
     Ok(format!("{out_dir}/solder_fatigue.json"))
 }
 
+/// Auto-generate a .pcprep with default settings from the CVG file, then
+/// immediately run rpim_solver.  Used when the user clicks Solve without
+/// having previously run Point Cloud generation.
+///
+/// Returns path to solder_fatigue.json.
+#[tauri::command]
+async fn run_solver_auto(
+    app: AppHandle,
+    cvg_path: String,
+    out_dir: String,
+) -> Result<String, String> {
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("Cannot create out_dir: {e}"))?;
+
+    // ── Step 1: generate the point cloud with default settings ────────────────
+    emit(&app, "generate_pc", "Auto-generating RPIM point cloud (default settings)…", false, None);
+
+    let pc_bin = find_bin("rpim_pc")
+        .ok_or_else(|| "rpim_pc binary not found".to_string())?;
+
+    let base = Path::new(&cvg_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Call rpim_pc without a config path — it will auto-generate rpim_input.json
+    // with 200×200×(n_layers×2) defaults for PCB layers and 5×5×3 for solder.
+    let out_base     = Path::new(&out_dir).join(&base);
+    let out_base_str = out_base.to_string_lossy().to_string();
+
+    let pc_log = Path::new(&out_dir).join("rpim_pc.dat");
+    run_streamed(
+        &app,
+        "generate_pc",
+        &pc_bin,
+        &[&cvg_path, "--out", &out_base_str],
+        Some(&pc_log),
+    )?;
+
+    // ── Step 2: solve ─────────────────────────────────────────────────────────
+    let pcprep_path = format!("{out_base_str}.pcprep");
+    if !Path::new(&pcprep_path).exists() {
+        return Err(format!("rpim_pc did not produce {pcprep_path}"));
+    }
+
+    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
+
+    let solver_bin = find_bin("rpim_solver")
+        .ok_or_else(|| "rpim_solver binary not found".to_string())?;
+
+    let solver_log = Path::new(&out_dir).join("rpim_solver.dat");
+    run_streamed(
+        &app,
+        "solver",
+        &solver_bin,
+        &[&pcprep_path, "--output-dir", &out_dir],
+        Some(&solver_log),
+    )?;
+
+    Ok(format!("{out_dir}/solder_fatigue.json"))
+}
+
 // ─── app entry point ─────────────────────────────────────────────────────────
 
 pub fn run() {
@@ -361,6 +424,7 @@ pub fn run() {
             run_import,
             run_generate_pc,
             run_solver,
+            run_solver_auto,
             read_json_file,
             read_trace_map,
         ])
