@@ -618,10 +618,28 @@ enum PcresRecord {
     },
 }
 
+/// Parse a `.pcres` file and return only solder-joint creep records.
+///
+/// The full creep pcres contains all assembly nodes (PCB + components + solder joints).
+/// Solder joints are a small fraction; this avoids transferring millions of records
+/// over IPC when only the ΔW / displacement contour on solder joints is needed.
+#[tauri::command]
+async fn read_pcres_solder(path: String) -> Result<Vec<PcresRecord>, String> {
+    let all = read_pcres_data(&path)?;
+    Ok(all.into_iter().filter(|r| {
+        if let PcresRecord::Creep { body_name, .. } = r { body_name.starts_with("solder_") }
+        else { false }
+    }).collect())
+}
+
 /// Parse a `.pcres` binary file and return all records as JSON-serialisable values.
 #[tauri::command]
 async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
-    let data = std::fs::read(&path)
+    read_pcres_data(&path)
+}
+
+fn read_pcres_data(path: &str) -> Result<Vec<PcresRecord>, String> {
+    let data = std::fs::read(path)
         .map_err(|e| format!("Cannot read '{path}': {e}"))?;
 
     let mut pos = 0usize;
@@ -743,6 +761,7 @@ pub fn run() {
             read_json_file,
             read_trace_map,
             read_pcres,
+            read_pcres_solder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ElectroniX");
