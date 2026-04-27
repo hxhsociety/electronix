@@ -140,10 +140,12 @@ fn find_bin(name: &str) -> Option<PathBuf> {
     }
 
     let ws = workspace_root()?;
-    let r = ws.join("target").join("release").join(&exe_name);
-    if r.exists() { return Some(r); }
+    // Prefer debug over release so the latest rebuilt binary is always used in dev.
+    // In production the exe-adjacent path (checked first above) takes precedence.
     let d = ws.join("target").join("debug").join(&exe_name);
     if d.exists() { return Some(d); }
+    let r = ws.join("target").join("release").join(&exe_name);
+    if r.exists() { return Some(r); }
     None
 }
 
@@ -470,6 +472,13 @@ async fn run_solver(
     Ok(format!("{sim_dir_str}/{stem}_solder_fatigue.json"))
 }
 
+/// Result returned by run_solver_auto.
+#[derive(serde::Serialize, Clone)]
+struct SolverAutoResult {
+    fatigue_path: String,
+    pcprep_path:  String,
+}
+
 /// Auto-generate pcprep with defaults + run solver; used for "quick solve" flow.
 #[tauri::command]
 async fn run_solver_auto(
@@ -477,7 +486,7 @@ async fn run_solver_auto(
     cvg_path:   String,
     session_id: String,
     sim_name:   String,
-) -> Result<String, String> {
+) -> Result<SolverAutoResult, String> {
     // ── Step 1: point cloud ───────────────────────────────────────────────────
     let pc_dir = appdata_root().join(&session_id).join("point_cloud");
     std::fs::create_dir_all(&pc_dir)
@@ -537,7 +546,10 @@ async fn run_solver_auto(
         Some(&solver_log),
     )?;
 
-    Ok(format!("{sim_dir_str}/{sim_name}_solder_fatigue.json"))
+    Ok(SolverAutoResult {
+        fatigue_path: format!("{sim_dir_str}/{sim_name}_solder_fatigue.json"),
+        pcprep_path:  pcprep_path,
+    })
 }
 
 // ─── File utilities ───────────────────────────────────────────────────────────
