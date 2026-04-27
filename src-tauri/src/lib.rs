@@ -241,9 +241,12 @@ async fn check_model_exists() -> bool {
 
 // ─── Import (CVG → GLB) ───────────────────────────────────────────────────────
 
-/// Convert a CVG file to GLB and write to `session/models/<board>.glb`.
+/// Convert a CVG file to GLB.
 ///
-/// Returns the full path of the written GLB.
+/// Writes to `session/models/<board>.glb` (primary, session-managed copy) and
+/// also copies to `<workspace>/frontend/public/model.glb` so the Viewer3D
+/// dev-server path `/model.glb` continues to work during development.
+/// Returns the session GLB path.
 #[tauri::command]
 async fn run_import(
     app:        AppHandle,
@@ -264,6 +267,16 @@ async fn run_import(
         .ok_or_else(|| "gltf_convertor binary not found".to_string())?;
 
     run_streamed(&app, "import", &bin, &[&cvg_path, "--glb", &glb_str], None)?;
+
+    // Dev-mode compat: Viewer3D loads from `/model.glb` served by the Vite dev
+    // server out of frontend/public/.  Copy the generated file there so the 3D
+    // viewer updates without touching the Viewer3D component.
+    if let Some(ws) = workspace_root() {
+        let pub_glb = ws.join("frontend").join("public").join("model.glb");
+        if let Some(parent) = pub_glb.parent() { std::fs::create_dir_all(parent).ok(); }
+        std::fs::copy(&glb_path, &pub_glb).ok();
+    }
+
     Ok(glb_str)
 }
 
