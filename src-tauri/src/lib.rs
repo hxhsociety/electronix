@@ -1,13 +1,24 @@
 // ─── ElectroniX Tauri backend ────────────────────────────────────────────────
 //
-// Commands exposed to the frontend:
-//   pick_file          → native open-file dialog → returns chosen path
-//   run_import         → gltf_convertor.exe cvg → model.glb
-//   run_generate_pc    → writes rpim_input.json  → rpim_pc.exe
-//   run_solver         → rpim_solver.exe
+// Session layout  (%AppData%\ElectroniX\<uuid>\):
+//   models\          ← <board>.glb  (gltf_convertor output)
+//   point_cloud\     ← <board>.pcprep + rpim_pc.log
+//   simulation\
+//     <SimName>\     ← <SimName>.pcsim + solver outputs + rpim_solver.log
 //
-// All long-running commands stream stdout lines as "job://progress" events so
-// the React status pill can show live output without blocking.
+// Commands:
+//   new_session            → create session dir, return session_id + base dirs
+//   session_dirs           → resolve dirs for an existing session_id
+//   pick_file              → native open-file dialog
+//   run_import             → gltf_convertor → models/<board>.glb
+//   run_generate_pc        → rpim_pc → point_cloud/<board>.pcprep
+//   write_pcsim_file       → write simulation/<SimName>/<SimName>.pcsim
+//   run_solver             → rpim_solver → simulation/<SimName>/…
+//   run_solver_auto        → generate_pc + solver in one step
+//   check_model_exists     → legacy check for frontend startup
+//   read_json_file         → return file contents as string
+//   read_trace_map         → parse *PCB_POINT_CLOUD from .pcprep
+//   read_pcres             → parse binary .pcres result file
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -15,46 +26,124 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
-// ─── helpers ─────────────────────────────────────────────────────────────────
+// ─── Session management ───────────────────────────────────────────────────────
+
+/// Root directory for all ElectroniX session data.
+fn appdata_root() -> PathBuf {
+    // Windows: %APPDATA%\ElectroniX
+    // macOS:   ~/Library/Application Support/ElectroniX  (via HOME)
+    // Linux:   ~/.local/share/ElectroniX
+    let base = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("."));
+            if cfg!(target_os = "macos") {
+                home.join("Library").join("Application Support")
+            } else {
+                home.join(".local").join("share")
+            }
+        });
+    base.join("ElectroniX")
+}
+
+/// Paths for one session.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct SessionDirs {
+    pub session_id:   String,
+    pub root:         String,   // %AppData%/ElectroniX/<uuid>
+    pub models_dir:   String,   // root/models
+    pub pc_dir:       String,   // root/point_cloud
+    pub sim_base_dir: String,   // root/simulation
+}
+
+impl SessionDirs {
+    fn from_root(session_id: &str, root: &Path) -> Self {
+        SessionDirs {
+            session_id:   session_id.to_string(),
+            root:         root.to_string_lossy().to_string(),
+            models_dir:   root.join("models").to_string_lossy().to_string(),
+            pc_dir:       root.join("point_cloud").to_string_lossy().to_string(),
+            sim_base_dir: root.join("simulation").to_string_lossy().to_string(),
+        }
+    }
+
+    fn create_dirs(&self) -> Result<(), String> {
+        for d in [&self.models_dir, &self.pc_dir, &self.sim_base_dir] {
+            std::fs::create_dir_all(d)
+                .map_err(|e| format!("Cannot create {d}: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Create a fresh session folder and return its paths.
+#[tauri::command]
+async fn new_session() -> Result<SessionDirs, String> {
+    let session_id = uuid_v4();
+    let root = appdata_root().join(&session_id);
+    let dirs = SessionDirs::from_root(&session_id, &root);
+    dirs.create_dirs()?;
+    Ok(dirs)
+}
+
+/// Resolve paths for an existing session_id (does NOT create dirs).
+#[tauri::command]
+async fn session_dirs(session_id: String) -> Result<SessionDirs, String> {
+    let root = appdata_root().join(&session_id);
+    if !root.exists() {
+        return Err(format!("Session '{session_id}' not found"));
+    }
+    Ok(SessionDirs::from_root(&session_id, &root))
+}
+
+/// Tiny UUID v4 using rand (no extra dep — pulls from getrandom already in tree).
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Deterministic-but-unique enough for local session IDs.
+    // Uses process-mixed timestamp + counter; not crypto-grade.
+    static COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let cnt = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Mix ts + cnt into 128 bits via splitmix64
+    let mut h = ts as u64 ^ 0x9e3779b97f4a7c15;
+    h = h.wrapping_add(cnt).wrapping_mul(0x6c62272e07bb0142);
+    h ^= h >> 30; h = h.wrapping_mul(0xbf58476d1ce4e5b9);
+    h ^= h >> 27; h = h.wrapping_mul(0x94d049bb133111eb);
+    let lo = h ^ (h >> 31);
+    let hi = (ts >> 64) as u64 ^ cnt.wrapping_mul(0x517cc1b727220a95);
+    format!("{:016x}-{:016x}", lo, hi)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Locate the project workspace root on disk.
 fn workspace_root() -> Option<PathBuf> {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.to_path_buf())
 }
 
-/// Locate a binary.  Search order:
-///   1. same directory as the running exe  (bundled / _dist layout)
-///   2. <workspace>/target/release/        (release dev)
-///   3. <workspace>/target/debug/          (debug dev)
+/// Locate a binary. Search order:
+///   1. same dir as running exe (bundled / _dist layout)
+///   2. <workspace>/target/release/
+///   3. <workspace>/target/debug/
 fn find_bin(name: &str) -> Option<PathBuf> {
-    let exe_name = if cfg!(windows) {
-        format!("{}.exe", name)
-    } else {
-        name.to_string()
-    };
+    let exe_name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
 
-    // 1. next to current exe
     if let Ok(exe) = std::env::current_exe() {
-        let candidate = exe.parent()?.join(&exe_name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
+        let c = exe.parent()?.join(&exe_name);
+        if c.exists() { return Some(c); }
     }
 
-    let workspace = workspace_root()?;
-
-    // 2. release build
-    let release = workspace.join("target").join("release").join(&exe_name);
-    if release.exists() {
-        return Some(release);
-    }
-
-    // 3. debug build
-    let debug = workspace.join("target").join("debug").join(&exe_name);
-    if debug.exists() {
-        return Some(debug);
-    }
-
+    let ws = workspace_root()?;
+    let r = ws.join("target").join("release").join(&exe_name);
+    if r.exists() { return Some(r); }
+    let d = ws.join("target").join("debug").join(&exe_name);
+    if d.exists() { return Some(d); }
     None
 }
 
@@ -68,19 +157,12 @@ struct ProgressEvent {
 }
 
 fn emit(app: &AppHandle, step: &str, line: &str, done: bool, error: Option<String>) {
-    let _ = app.emit(
-        "job://progress",
-        ProgressEvent {
-            step:  step.to_string(),
-            line:  line.to_string(),
-            done,
-            error,
-        },
-    );
+    let _ = app.emit("job://progress", ProgressEvent {
+        step: step.to_string(), line: line.to_string(), done, error,
+    });
 }
 
-/// Run a binary, stream every stdout line as a progress event, and optionally
-/// write the full transcript to `log_path` (e.g. rpim_pc.dat).
+/// Run a binary, stream every stdout line as a progress event, and write a log file.
 fn run_streamed(
     app:      &AppHandle,
     step:     &str,
@@ -93,23 +175,21 @@ fn run_streamed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to start {}: {}", bin.display(), e))?;
+        .map_err(|e| format!("Failed to start {}: {e}", bin.display()))?;
 
-    // Shared buffer: stdout lines collected for the log AND emitted as events
     let log_buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let log_buf_clone = Arc::clone(&log_buf);
-    let app_clone     = app.clone();
-    let step_str      = step.to_string();
-    let stdout        = child.stdout.take().unwrap();
+    let log_buf2  = Arc::clone(&log_buf);
+    let app2      = app.clone();
+    let step_str  = step.to_string();
+    let stdout    = child.stdout.take().unwrap();
 
     let handle = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().flatten() {
-            emit(&app_clone, &step_str, &line, false, None);
-            log_buf_clone.lock().unwrap().push(line);
+            emit(&app2, &step_str, &line, false, None);
+            log_buf2.lock().unwrap().push(line);
         }
     });
 
-    // Collect stderr for error reporting
     let stderr_out = {
         let stderr = child.stderr.take().unwrap();
         let mut buf = String::new();
@@ -123,7 +203,6 @@ fn run_streamed(
     let _ = handle.join();
     let status = child.wait().map_err(|e| e.to_string())?;
 
-    // Write log file
     if let Some(lp) = log_path {
         let lines = log_buf.lock().unwrap();
         let content = format!("{}\n{}", lines.join("\n"), stderr_out.trim());
@@ -134,34 +213,25 @@ fn run_streamed(
         emit(app, step, "Done.", true, None);
         Ok(())
     } else {
-        let msg = format!("{} failed (exit {:?})\n{}", step, status.code(), stderr_out.trim());
+        let msg = format!("{step} failed (exit {:?})\n{}", status.code(), stderr_out.trim());
         emit(app, step, &msg, true, Some(msg.clone()));
         Err(msg)
     }
 }
 
-// ─── commands ────────────────────────────────────────────────────────────────
+// ─── Commands ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    
     app.dialog().file()
         .add_filter("IPC-2581 board", &["cvg", "xml"])
-        .pick_file(move |path| {
-            let res = path.map(|p| p.to_string());
-            let _ = tx.send(res);
-        });
-    
-    let result = rx.await.map_err(|e| e.to_string())?;
-    println!("pick_file returning: {:?}", result);
-    Ok(result)
+        .pick_file(move |path| { let _ = tx.send(path.map(|p| p.to_string())); });
+    rx.await.map_err(|e| e.to_string())
 }
 
-/// Check whether model.glb exists in the frontend public directory.
-/// Called by App.tsx on startup to decide whether to show the project
-/// screen or the main viewer — more reliable than a fetch() in WebView2.
+/// Check whether model.glb exists in the frontend public directory (legacy startup check).
 #[tauri::command]
 async fn check_model_exists() -> bool {
     workspace_root()
@@ -169,24 +239,24 @@ async fn check_model_exists() -> bool {
         .unwrap_or(false)
 }
 
-/// Convert a CVG board file to GLB using gltf_convertor.
+// ─── Import (CVG → GLB) ───────────────────────────────────────────────────────
+
+/// Convert a CVG file to GLB and write to `session/models/<board>.glb`.
 ///
-/// out_dir  — directory to place model.glb  (created if absent)
-/// Returns the path of the written GLB.
+/// Returns the full path of the written GLB.
 #[tauri::command]
 async fn run_import(
-    app: AppHandle,
-    cvg_path: String,
-    out_dir: Option<String>,
+    app:        AppHandle,
+    cvg_path:   String,
+    session_id: String,
 ) -> Result<String, String> {
-    let workspace = workspace_root().ok_or_else(|| "Workspace root could not be determined".to_string())?;
-    let out_dir = out_dir.unwrap_or_else(|| workspace.join("frontend").join("public").to_string_lossy().to_string());
+    let models_dir = appdata_root().join(&session_id).join("models");
+    std::fs::create_dir_all(&models_dir)
+        .map_err(|e| format!("Cannot create models dir: {e}"))?;
 
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Cannot create out_dir: {e}"))?;
-
-    let glb_path = Path::new(&out_dir).join("model.glb");
-    let glb_str = glb_path.to_string_lossy().to_string();
+    let board_stem = board_stem(&cvg_path);
+    let glb_path   = models_dir.join(format!("{board_stem}.glb"));
+    let glb_str    = glb_path.to_string_lossy().to_string();
 
     emit(&app, "import", "Converting CVG → GLB…", false, None);
 
@@ -194,11 +264,12 @@ async fn run_import(
         .ok_or_else(|| "gltf_convertor binary not found".to_string())?;
 
     run_streamed(&app, "import", &bin, &[&cvg_path, "--glb", &glb_str], None)?;
-
     Ok(glb_str)
 }
 
-/// Result of run_generate_pc — paths to all output files.
+// ─── Point cloud generation ───────────────────────────────────────────────────
+
+/// Result of run_generate_pc.
 #[derive(serde::Serialize, Clone)]
 struct GeneratePcResult {
     pcprep_path:    String,
@@ -206,50 +277,51 @@ struct GeneratePcResult {
     materials_path: String,
 }
 
-/// Write rpim_input.json to disk then run rpim_pc.
+/// Run rpim_pc and write outputs to `session/point_cloud/`.
 ///
-/// config_json — serialised PointCloudSettings JSON string
-/// out_dir     — directory for all rpim_pc outputs  (created if absent)
-/// Returns paths to the generated pcprep / config / materials files.
+/// config_json — serialised PointCloudSettings JSON (empty string = use defaults)
+/// Returns paths to the generated .pcprep / config / materials files.
 #[tauri::command]
 async fn run_generate_pc(
-    app: AppHandle,
-    cvg_path: String,
+    app:        AppHandle,
+    cvg_path:   String,
     config_json: String,
-    out_dir: String,
+    session_id: String,
 ) -> Result<GeneratePcResult, String> {
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Cannot create out_dir: {e}"))?;
+    let pc_dir = appdata_root().join(&session_id).join("point_cloud");
+    std::fs::create_dir_all(&pc_dir)
+        .map_err(|e| format!("Cannot create point_cloud dir: {e}"))?;
 
-    // derive base name from cvg filename
-    let base = Path::new(&cvg_path)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    // write the config
-    let json_path = Path::new(&out_dir).join(format!("{base}_rpim_input.json"));
-    std::fs::write(&json_path, &config_json)
-        .map_err(|e| format!("Cannot write rpim_input.json: {e}"))?;
-
-    let out_base     = Path::new(&out_dir).join(&base);
+    let board_stem   = board_stem(&cvg_path);
+    let out_base     = pc_dir.join(&board_stem);
     let out_base_str = out_base.to_string_lossy().to_string();
-    let json_str     = json_path.to_string_lossy().to_string();
-
-    emit(&app, "generate_pc", "Generating RPIM point cloud…", false, None);
 
     let bin = find_bin("rpim_pc")
         .ok_or_else(|| "rpim_pc binary not found".to_string())?;
 
-    let log_path = Path::new(&out_dir).join("rpim_pc.dat");
-    run_streamed(
-        &app,
-        "generate_pc",
-        &bin,
-        &[&cvg_path, &json_str, "--out", &out_base_str],
-        Some(&log_path),
-    )?;
+    let log_path = pc_dir.join("rpim_pc.log");
+
+    emit(&app, "generate_pc", "Generating RPIM point cloud…", false, None);
+
+    if config_json.trim().is_empty() {
+        // No config — let rpim_pc use its defaults
+        run_streamed(
+            &app, "generate_pc", &bin,
+            &[&cvg_path, "--out", &out_base_str],
+            Some(&log_path),
+        )?;
+    } else {
+        // Write the config JSON next to the pcprep output
+        let json_path    = pc_dir.join(format!("{board_stem}_rpim_input.json"));
+        let json_path_str = json_path.to_string_lossy().to_string();
+        std::fs::write(&json_path, &config_json)
+            .map_err(|e| format!("Cannot write rpim_input.json: {e}"))?;
+        run_streamed(
+            &app, "generate_pc", &bin,
+            &[&cvg_path, &json_path_str, "--out", &out_base_str],
+            Some(&log_path),
+        )?;
+    }
 
     Ok(GeneratePcResult {
         pcprep_path:    format!("{out_base_str}.pcprep"),
@@ -258,185 +330,51 @@ async fn run_generate_pc(
     })
 }
 
-/// Read any text/JSON file from disk and return its contents as a string.
-/// Used by the frontend to load rpim_config.json after point-cloud generation.
-#[tauri::command]
-async fn read_json_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path)
-        .map_err(|e| format!("Cannot read {path}: {e}"))
-}
+// ─── .pcsim writer ────────────────────────────────────────────────────────────
 
-/// One node from the *PCB_POINT_CLOUD section of a .pcprep file.
-#[derive(serde::Serialize, Clone)]
-struct TraceNode {
-    x:              f32,
-    y:              f32,
-    z:              f32,
-    metal_fraction: f32,
-}
-
-/// Parse the *PCB_POINT_CLOUD section from a .pcprep file.
-/// Returns every line that has four whitespace-separated numbers.
-/// Used by the Material Browser's "Trace Map" view.
-#[tauri::command]
-async fn read_trace_map(pcprep_path: String) -> Result<Vec<TraceNode>, String> {
-    let content = std::fs::read_to_string(&pcprep_path)
-        .map_err(|e| format!("Cannot read {pcprep_path}: {e}"))?;
-
-    let mut nodes: Vec<TraceNode> = Vec::new();
-    let mut in_block = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.eq_ignore_ascii_case("*PCB_POINT_CLOUD")
-            || trimmed.to_ascii_uppercase().starts_with("*PCB_POINT_CLOUD")
-        {
-            in_block = true;
-            continue;
-        }
-
-        if in_block {
-            // A new section header ends the block
-            if trimmed.starts_with('*') {
-                break;
-            }
-            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with("//") {
-                continue;
-            }
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 4 {
-                if let (Ok(x), Ok(y), Ok(z), Ok(mf)) = (
-                    parts[0].parse::<f32>(),
-                    parts[1].parse::<f32>(),
-                    parts[2].parse::<f32>(),
-                    parts[3].parse::<f32>(),
-                ) {
-                    nodes.push(TraceNode { x, y, z, metal_fraction: mf });
-                }
-            }
-        }
-    }
-
-    Ok(nodes)
-}
-
-/// Run rpim_solver on an existing .pcprep file.
-///
-/// Returns path to solder_fatigue.json.
-#[tauri::command]
-async fn run_solver(
-    app: AppHandle,
-    pcprep_path: String,
-    out_dir: String,
-) -> Result<String, String> {
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Cannot create out_dir: {e}"))?;
-
-    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
-
-    let bin = find_bin("rpim_solver")
-        .ok_or_else(|| "rpim_solver binary not found".to_string())?;
-
-    let log_path = Path::new(&out_dir).join("rpim_solver.dat");
-    run_streamed(
-        &app,
-        "solver",
-        &bin,
-        &[&pcprep_path, "--output-dir", &out_dir],
-        Some(&log_path),
-    )?;
-
-    Ok(format!("{out_dir}/solder_fatigue.json"))
-}
-
-/// Auto-generate a .pcprep with default settings from the CVG file, then
-/// immediately run rpim_solver.  Used when the user clicks Solve without
-/// having previously run Point Cloud generation.
-///
-/// Returns path to solder_fatigue.json.
-#[tauri::command]
-async fn run_solver_auto(
-    app: AppHandle,
-    cvg_path: String,
-    out_dir: String,
-) -> Result<String, String> {
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| format!("Cannot create out_dir: {e}"))?;
-
-    // ── Step 1: generate the point cloud with default settings ────────────────
-    emit(&app, "generate_pc", "Auto-generating RPIM point cloud (default settings)…", false, None);
-
-    let pc_bin = find_bin("rpim_pc")
-        .ok_or_else(|| "rpim_pc binary not found".to_string())?;
-
-    let base = Path::new(&cvg_path)
-        .file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-
-    // Call rpim_pc without a config path — it will auto-generate rpim_input.json
-    // with 200×200×(n_layers×2) defaults for PCB layers and 5×5×3 for solder.
-    let out_base     = Path::new(&out_dir).join(&base);
-    let out_base_str = out_base.to_string_lossy().to_string();
-
-    let pc_log = Path::new(&out_dir).join("rpim_pc.dat");
-    run_streamed(
-        &app,
-        "generate_pc",
-        &pc_bin,
-        &[&cvg_path, "--out", &out_base_str],
-        Some(&pc_log),
-    )?;
-
-    // ── Step 2: solve ─────────────────────────────────────────────────────────
-    let pcprep_path = format!("{out_base_str}.pcprep");
-    if !Path::new(&pcprep_path).exists() {
-        return Err(format!("rpim_pc did not produce {pcprep_path}"));
-    }
-
-    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
-
-    let solver_bin = find_bin("rpim_solver")
-        .ok_or_else(|| "rpim_solver binary not found".to_string())?;
-
-    let solver_log = Path::new(&out_dir).join("rpim_solver.dat");
-    run_streamed(
-        &app,
-        "solver",
-        &solver_bin,
-        &[&pcprep_path, "--output-dir", &out_dir],
-        Some(&solver_log),
-    )?;
-
-    Ok(format!("{out_dir}/solder_fatigue.json"))
-}
-
-// ─── .pcsim writer ───────────────────────────────────────────────────────────
-
-/// Parameters for writing a .pcsim simulation load deck.
+/// Parameters for a .pcsim simulation load deck.
 #[derive(serde::Deserialize)]
 struct PcsimParams {
-    pcprep_path:  String,
-    ambient_c:    f64,
-    curve_name:   String,
-    profile_pts:  Vec<[f64; 2]>,   // [[time_min, temp_c], ...]
-    n_cycles:     usize,
-    pad_d_mm:     f64,
-    solder_h_mm:  f64,
+    session_id:  String,
+    sim_name:    String,
+    pcprep_path: String,   // absolute path to the .pcprep (will be made relative)
+    ambient_c:   f64,
+    curve_name:  String,
+    profile_pts: Vec<[f64; 2]>,   // [[time_min, temp_c], ...]
+    n_cycles:    usize,
+    pad_d_mm:    f64,
+    solder_h_mm: f64,
 }
 
-/// Write a `.pcsim` simulation load deck to `out_path` and return the path.
+/// Write a .pcsim deck to `session/simulation/<sim_name>/<sim_name>.pcsim`.
+///
+/// The *INCLUDE path inside the file is written relative to the .pcsim location
+/// so the file is portable if the session folder is moved.
+/// Returns the absolute path of the written .pcsim.
 #[tauri::command]
-async fn write_pcsim(params: PcsimParams, out_path: String) -> Result<String, String> {
+async fn write_pcsim_file(params: PcsimParams) -> Result<String, String> {
+    let sim_dir = appdata_root()
+        .join(&params.session_id)
+        .join("simulation")
+        .join(&params.sim_name);
+    std::fs::create_dir_all(&sim_dir)
+        .map_err(|e| format!("Cannot create simulation dir: {e}"))?;
+
+    let pcsim_path = sim_dir.join(format!("{}.pcsim", params.sim_name));
+
+    // Make the pcprep path relative to the .pcsim directory so the file is portable.
+    let pcprep_rel = relative_path(&sim_dir, Path::new(&params.pcprep_path));
+
     let pts: Vec<(f64, f64)> = params.profile_pts.iter().map(|p| (p[0], p[1])).collect();
     let text = build_pcsim_text(
-        &params.pcprep_path, params.ambient_c, &params.curve_name,
+        &pcprep_rel, params.ambient_c, &params.curve_name,
         &pts, params.n_cycles, params.pad_d_mm, params.solder_h_mm,
     );
-    std::fs::write(&out_path, &text).map_err(|e| format!("Cannot write {out_path}: {e}"))?;
-    Ok(out_path)
+
+    std::fs::write(&pcsim_path, &text)
+        .map_err(|e| format!("Cannot write .pcsim: {e}"))?;
+
+    Ok(pcsim_path.to_string_lossy().to_string())
 }
 
 fn build_pcsim_text(
@@ -459,37 +397,203 @@ fn build_pcsim_text(
     s
 }
 
+/// Compute a relative path from `base_dir` to `target`.
+/// Falls back to the absolute path string if relative can't be determined.
+fn relative_path(base_dir: &Path, target: &Path) -> String {
+    // Walk up from base_dir until we find a common prefix, then build ../.. chain
+    let base_parts: Vec<_>   = base_dir.components().collect();
+    let target_parts: Vec<_> = target.components().collect();
+    let common = base_parts.iter().zip(target_parts.iter())
+        .take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return target.to_string_lossy().to_string();
+    }
+    let ups = base_parts.len() - common;
+    let mut rel = PathBuf::new();
+    for _ in 0..ups { rel.push(".."); }
+    for part in &target_parts[common..] { rel.push(part); }
+    // Use forward slashes (works on all platforms in pcsim parser)
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+// ─── Solver ───────────────────────────────────────────────────────────────────
+
+/// Run rpim_solver on a .pcsim file inside `session/simulation/<sim_name>/`.
+///
+/// Outputs land in the same simulation folder; log written to rpim_solver.log.
+/// Returns path to the solder_fatigue.json result.
+#[tauri::command]
+async fn run_solver(
+    app:        AppHandle,
+    pcsim_path: String,
+    session_id: String,
+    sim_name:   String,
+) -> Result<String, String> {
+    let sim_dir = appdata_root()
+        .join(&session_id)
+        .join("simulation")
+        .join(&sim_name);
+    std::fs::create_dir_all(&sim_dir)
+        .map_err(|e| format!("Cannot create simulation dir: {e}"))?;
+
+    let sim_dir_str = sim_dir.to_string_lossy().to_string();
+    let log_path    = sim_dir.join("rpim_solver.log");
+
+    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
+
+    let bin = find_bin("rpim_solver")
+        .ok_or_else(|| "rpim_solver binary not found".to_string())?;
+
+    run_streamed(
+        &app, "solver", &bin,
+        &[&pcsim_path, "--out-dir", &sim_dir_str],
+        Some(&log_path),
+    )?;
+
+    // Find the fatigue JSON — solver names it <stem>_solder_fatigue.json
+    let stem = Path::new(&pcsim_path)
+        .file_stem().unwrap_or_default()
+        .to_string_lossy().to_string();
+    Ok(format!("{sim_dir_str}/{stem}_solder_fatigue.json"))
+}
+
+/// Auto-generate pcprep with defaults + run solver; used for "quick solve" flow.
+#[tauri::command]
+async fn run_solver_auto(
+    app:        AppHandle,
+    cvg_path:   String,
+    session_id: String,
+    sim_name:   String,
+) -> Result<String, String> {
+    // ── Step 1: point cloud ───────────────────────────────────────────────────
+    let pc_dir = appdata_root().join(&session_id).join("point_cloud");
+    std::fs::create_dir_all(&pc_dir)
+        .map_err(|e| format!("Cannot create point_cloud dir: {e}"))?;
+
+    let board_stem   = board_stem(&cvg_path);
+    let out_base     = pc_dir.join(&board_stem);
+    let out_base_str = out_base.to_string_lossy().to_string();
+    let pc_log       = pc_dir.join("rpim_pc.log");
+
+    let pc_bin = find_bin("rpim_pc")
+        .ok_or_else(|| "rpim_pc binary not found".to_string())?;
+
+    emit(&app, "generate_pc", "Auto-generating RPIM point cloud…", false, None);
+    run_streamed(
+        &app, "generate_pc", &pc_bin,
+        &[&cvg_path, "--out", &out_base_str],
+        Some(&pc_log),
+    )?;
+
+    let pcprep_path = format!("{out_base_str}.pcprep");
+    if !Path::new(&pcprep_path).exists() {
+        return Err(format!("rpim_pc did not produce {pcprep_path}"));
+    }
+
+    // ── Step 2: write default pcsim ───────────────────────────────────────────
+    let sim_dir = appdata_root()
+        .join(&session_id).join("simulation").join(&sim_name);
+    std::fs::create_dir_all(&sim_dir)
+        .map_err(|e| format!("Cannot create simulation dir: {e}"))?;
+
+    let pcsim_path = sim_dir.join(format!("{sim_name}.pcsim"));
+    let pcprep_rel = relative_path(&sim_dir, Path::new(&pcprep_path));
+    // TC-B default profile: -55 → +125°C
+    let default_pts = vec![
+        (0.0, 25.0), (6.0, -55.0), (21.0, -55.0),
+        (34.0, 125.0), (49.0, 125.0), (56.0, 25.0),
+    ];
+    let pcsim_text = build_pcsim_text(
+        &pcprep_rel, 25.0, "TC-B", &default_pts, 1, 0.5, 0.30,
+    );
+    std::fs::write(&pcsim_path, &pcsim_text)
+        .map_err(|e| format!("Cannot write auto .pcsim: {e}"))?;
+
+    // ── Step 3: solve ─────────────────────────────────────────────────────────
+    let sim_dir_str  = sim_dir.to_string_lossy().to_string();
+    let pcsim_str    = pcsim_path.to_string_lossy().to_string();
+    let solver_log   = sim_dir.join("rpim_solver.log");
+
+    let solver_bin = find_bin("rpim_solver")
+        .ok_or_else(|| "rpim_solver binary not found".to_string())?;
+
+    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
+    run_streamed(
+        &app, "solver", &solver_bin,
+        &[&pcsim_str, "--out-dir", &sim_dir_str],
+        Some(&solver_log),
+    )?;
+
+    Ok(format!("{sim_dir_str}/{sim_name}_solder_fatigue.json"))
+}
+
+// ─── File utilities ───────────────────────────────────────────────────────────
+
+/// Read any text/JSON file from disk and return its contents as a string.
+#[tauri::command]
+async fn read_json_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {path}: {e}"))
+}
+
+/// One node from the *PCB_POINT_CLOUD section of a .pcprep file.
+#[derive(serde::Serialize, Clone)]
+struct TraceNode { x: f32, y: f32, z: f32, metal_fraction: f32 }
+
+/// Parse the *PCB_POINT_CLOUD section from a .pcprep file (trace-map view).
+#[tauri::command]
+async fn read_trace_map(pcprep_path: String) -> Result<Vec<TraceNode>, String> {
+    let content = std::fs::read_to_string(&pcprep_path)
+        .map_err(|e| format!("Cannot read {pcprep_path}: {e}"))?;
+
+    let mut nodes: Vec<TraceNode> = Vec::new();
+    let mut in_block = false;
+
+    for line in content.lines() {
+        let t = line.trim();
+        if t.to_ascii_uppercase().starts_with("*PCB_POINT_CLOUD") {
+            in_block = true; continue;
+        }
+        if in_block {
+            if t.starts_with('*') { break; }
+            if t.is_empty() || t.starts_with('#') || t.starts_with("//") { continue; }
+            let p: Vec<&str> = t.split_whitespace().collect();
+            if p.len() >= 4 {
+                if let (Ok(x), Ok(y), Ok(z), Ok(mf)) = (
+                    p[0].parse::<f32>(), p[1].parse::<f32>(),
+                    p[2].parse::<f32>(), p[3].parse::<f32>(),
+                ) { nodes.push(TraceNode { x, y, z, metal_fraction: mf }); }
+            }
+        }
+    }
+    Ok(nodes)
+}
+
 // ─── .pcres reader ────────────────────────────────────────────────────────────
 
-const PCRES_MAGIC:    &[u8; 8] = b"PCRESV1\n";
-const PCRES_CREEP:    u8       = 0;
-const PCRES_THERMAL:  u8       = 1;
-const FTYPE_F32:      u8       = 0;
-const FTYPE_U32:      u8       = 1;
-const FTYPE_STR:      u8       = 2;
+const PCRES_MAGIC:   &[u8; 8] = b"PCRESV1\n";
+const PCRES_CREEP:   u8 = 0;
+const PCRES_THERMAL: u8 = 1;
+const FTYPE_F32:     u8 = 0;
+const FTYPE_U32:     u8 = 1;
+const FTYPE_STR:     u8 = 2;
 
-/// A parsed point record from a `.pcres` file.
 #[derive(serde::Serialize, Clone)]
 #[serde(tag = "type")]
 enum PcresRecord {
     Creep {
-        node_id:   u32,
-        body_name: String,
+        node_id: u32, body_name: String,
         x: f32, y: f32, z: f32,
-        ux_um: f32, uy_um: f32, uz_um: f32,
-        mag_um: f32, dw_mpa: f32,
+        ux_um: f32, uy_um: f32, uz_um: f32, mag_um: f32, dw_mpa: f32,
     },
     Thermal {
-        node_id:    u32,
-        body_name:  String,
-        face_tag:   String,
+        node_id: u32, body_name: String, face_tag: String,
         x: f32, y: f32, z: f32,
-        t_min_c: f32, t_max_c: f32, delta_t_c: f32,
-        material_id: u32,
+        t_min_c: f32, t_max_c: f32, delta_t_c: f32, material_id: u32,
     },
 }
 
-/// Parse a `.pcres` binary file and return all point records as serialisable JSON.
+/// Parse a `.pcres` binary file and return all records as JSON-serialisable values.
 #[tauri::command]
 async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
     let data = std::fs::read(&path)
@@ -511,7 +615,7 @@ async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
     let field_count = read_u8!() as usize;
     let n           = read_u32!() as usize;
 
-    let mut field_types: Vec<u8>     = Vec::with_capacity(field_count);
+    let mut field_types: Vec<u8>      = Vec::with_capacity(field_count);
     let mut _field_names: Vec<String> = Vec::with_capacity(field_count);
     for _ in 0..field_count {
         let ftype    = read_u8!();
@@ -529,7 +633,7 @@ async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
 
     let read_pool_str = |off: usize| -> String {
         let start = pool_start + off;
-        let end = data[start..].iter().position(|&b| b == 0)
+        let end   = data[start..].iter().position(|&b| b == 0)
             .map(|i| start + i).unwrap_or(pool_start + pool_size);
         String::from_utf8_lossy(&data[start..end]).to_string()
     };
@@ -541,9 +645,9 @@ async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
         let z       = read_f32!();
         let node_id = read_u32!();
 
-        let mut fvals: Vec<f32>   = Vec::new();
-        let mut uvals: Vec<u32>   = Vec::new();
-        let mut svals: Vec<String>= Vec::new();
+        let mut fvals: Vec<f32>    = Vec::new();
+        let mut uvals: Vec<u32>    = Vec::new();
+        let mut svals: Vec<String> = Vec::new();
 
         for &ft in &field_types {
             match ft {
@@ -569,8 +673,8 @@ async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
                 let mut si = svals.into_iter();
                 PcresRecord::Thermal {
                     node_id,
-                    body_name:  si.next().unwrap_or_default(),
-                    face_tag:   si.next().unwrap_or_default(),
+                    body_name:   si.next().unwrap_or_default(),
+                    face_tag:    si.next().unwrap_or_default(),
                     x, y, z,
                     t_min_c:    fvals.first().copied().unwrap_or(0.0),
                     t_max_c:    fvals.get(1).copied().unwrap_or(0.0),
@@ -582,25 +686,37 @@ async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
         };
         records.push(rec);
     }
-
     Ok(records)
 }
 
-// ─── app entry point ─────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Extract the file stem from a CVG path for use as the board base name.
+fn board_stem(cvg_path: &str) -> String {
+    Path::new(cvg_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
+// ─── App entry point ──────────────────────────────────────────────────────────
 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            new_session,
+            session_dirs,
             pick_file,
             check_model_exists,
             run_import,
             run_generate_pc,
+            write_pcsim_file,
             run_solver,
             run_solver_auto,
             read_json_file,
             read_trace_map,
-            write_pcsim,
             read_pcres,
         ])
         .run(tauri::generate_context!())
