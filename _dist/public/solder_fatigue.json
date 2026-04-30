@@ -1,0 +1,141 @@
+{
+  "darveaux_K1": 3.22e-7,
+  "darveaux_K2": 0.847,
+  "darveaux_K3": 2.18e-9,
+  "darveaux_K4": 0.956,
+  "material": "SAC305",
+  "model": "Darveaux Energy-Based (IPC-9701A, Darveaux 2002)",
+  "standard": "JEDEC JESD22-A104F TC-B",
+  "summary": {
+    "at_risk": 0,
+    "critical": 0,
+    "marginal": 0,
+    "max_Nf_cycles": 5.4128609082698554e+17,
+    "min_Nf_cycles": 94964513859.5652,
+    "safe": 14976,
+    "total_joints": 14976
+  },
+  "top10_most_critical": [
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G2_E2",
+      "pin_number": "E2",
+      "ref_designator": "G2",
+      "risk": "SAFE",
+      "x_mm": 227.3531,
+      "y_mm": -24.5008
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G1_BP6",
+      "pin_number": "BP6",
+      "ref_designator": "G1",
+      "risk": "SAFE",
+      "x_mm": 84.9732,
+      "y_mm": -62.9008
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G1_H54",
+      "pin_number": "H54",
+      "ref_designator": "G1",
+      "risk": "SAFE",
+      "x_mm": 48.1731,
+      "y_mm": -24.5008
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G1_J52",
+      "pin_number": "J52",
+      "ref_designator": "G1",
+      "risk": "SAFE",
+      "x_mm": 48.973,
+      "y_mm": -26.1008
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G2_AU3",
+      "pin_number": "AU3",
+      "ref_designator": "G2",
+      "risk": "SAFE",
+      "x_mm": 201.7532,
+      "y_mm": -25.3009
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G2_D32",
+      "pin_number": "D32",
+      "ref_designator": "G2",
+      "risk": "SAFE",
+      "x_mm": 228.1532,
+      "y_mm": -48.5008
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_U4_V1",
+      "pin_number": "V1",
+      "ref_designator": "U4",
+      "risk": "SAFE",
+      "x_mm": 112.7061,
+      "y_mm": -79.6735
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_MEC7_2",
+      "pin_number": "2",
+      "ref_designator": "MEC7",
+      "risk": "SAFE",
+      "x_mm": 46.736,
+      "y_mm": -14.4272
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G2_B26",
+      "pin_number": "B26",
+      "ref_designator": "G2",
+      "risk": "SAFE",
+      "x_mm": 229.7532,
+      "y_mm": -43.701
+    },
+    {
+      "B1_life": 40513035926.78033,
+      "Nf_cycles": 94964513859.5652,
+      "delta_T_c": 180.0,
+      "delta_W_mpa": 0.0011662856582687973,
+      "joint_id": "solder_G2_AP32",
+      "pin_number": "AP32",
+      "ref_designator": "G2",
+      "risk": "SAFE",
+      "x_mm": 200.453,
+      "y_mm": -51.801
+    }
+  ],
+  "weibull_beta": 5.4
+}

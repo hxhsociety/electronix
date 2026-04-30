@@ -1,0 +1,17 @@
+# Rust build artifacts
+target/
+
+# Claude worktrees (CI-internal)
+.claude/worktrees/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+
+# _dist: large runtime assets — distribute separately, not in git
+_dist/public/thermal_summary.csv
+_dist/public/model.glb
+
+# OS
+.DS_Store
+Thumbs.db

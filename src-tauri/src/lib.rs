@@ -49,7 +49,8 @@ fn appdata_root() -> PathBuf {
 }
 
 /// Paths for one session.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionDirs {
     pub session_id:   String,
     pub root:         String,   // %AppData%/ElectroniX/<uuid>
@@ -78,18 +79,31 @@ impl SessionDirs {
     }
 }
 
+fn save_last_session(session_id: &str) {
+    let path = appdata_root().join("last_session.txt");
+    let _ = std::fs::write(path, session_id);
+}
+
+fn get_last_session_id() -> Option<String> {
+    let path = appdata_root().join("last_session.txt");
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
 /// Create a fresh session folder and return its paths.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn new_session() -> Result<SessionDirs, String> {
     let session_id = uuid_v4();
     let root = appdata_root().join(&session_id);
     let dirs = SessionDirs::from_root(&session_id, &root);
     dirs.create_dirs()?;
+    save_last_session(&session_id);
     Ok(dirs)
 }
 
 /// Resolve paths for an existing session_id (does NOT create dirs).
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn session_dirs(session_id: String) -> Result<SessionDirs, String> {
     let root = appdata_root().join(&session_id);
     if !root.exists() {
@@ -97,6 +111,20 @@ async fn session_dirs(session_id: String) -> Result<SessionDirs, String> {
     }
     Ok(SessionDirs::from_root(&session_id, &root))
 }
+
+/// On app startup, check if there is a valid previous session to resume.
+#[tauri::command]
+#[allow(non_snake_case)]
+async fn get_startup_session() -> Result<Option<SessionDirs>, String> {
+    if let Some(id) = get_last_session_id() {
+        let root = appdata_root().join(&id);
+        if root.exists() {
+            return Ok(Some(SessionDirs::from_root(&id, &root)));
+        }
+    }
+    Ok(None)
+}
+
 
 /// Tiny UUID v4 using rand (no extra dep — pulls from getrandom already in tree).
 fn uuid_v4() -> String {
@@ -224,6 +252,7 @@ fn run_streamed(
 // ─── Commands ─────────────────────────────────────────────────────────────────
 
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -233,13 +262,111 @@ async fn pick_file(app: tauri::AppHandle) -> Result<Option<String>, String> {
     rx.await.map_err(|e| e.to_string())
 }
 
-/// Check whether model.glb exists in the frontend public directory (legacy startup check).
+/// Check whether model.glb exists for a given session.
 #[tauri::command]
-async fn check_model_exists() -> bool {
-    workspace_root()
-        .map(|w| w.join("frontend").join("public").join("model.glb").exists())
-        .unwrap_or(false)
+#[allow(non_snake_case)]
+async fn check_model_exists(session_id: String) -> bool {
+    let models_dir = appdata_root().join(&session_id).join("models");
+    if let Ok(entries) = std::fs::read_dir(models_dir) {
+        for entry in entries.flatten() {
+            if let Some(ext) = entry.path().extension() {
+                if ext == "glb" { return true; }
+            }
+        }
+    }
+    false
 }
+
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+    pub model_glb:    Option<String>,
+    pub pcprep:       Option<String>,
+    pub thermal_csv:  Option<String>,
+    pub fatigue_json: Option<String>,
+    pub creep_pcres:  Option<String>,
+}
+
+/// Scan a session folder and return what files are available.
+#[tauri::command]
+#[allow(non_snake_case)]
+async fn get_session_status(session_id: String) -> Result<SessionStatus, String> {
+    let root = appdata_root().join(&session_id);
+    if !root.exists() { return Err(format!("Session {session_id} not found")); }
+
+    let mut status = SessionStatus {
+        model_glb:    None,
+        pcprep:       None,
+        thermal_csv:  None,
+        fatigue_json: None,
+        creep_pcres:  None,
+    };
+
+    // 1. Model
+    let models_dir = root.join("models");
+    if let Ok(entries) = std::fs::read_dir(models_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().map_or(false, |e| e == "glb") {
+                status.model_glb = Some(entry.path().to_string_lossy().to_string());
+                break;
+            }
+        }
+    }
+
+    // 2. Point cloud
+    let pc_dir = root.join("point_cloud");
+    if let Ok(entries) = std::fs::read_dir(pc_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().map_or(false, |e| e == "pcprep") {
+                status.pcprep = Some(p.to_string_lossy().to_string());
+                // Look for thermal_summary.csv with the same stem
+                let stem = p.file_stem().unwrap().to_string_lossy();
+                let csv = p.parent().unwrap().join(format!("{stem}_thermal_summary.csv"));
+                if csv.exists() {
+                    status.thermal_csv = Some(csv.to_string_lossy().to_string());
+                }
+                break;
+            }
+        }
+    }
+
+    // 3. Results (Simulation)
+    // Scan root/simulation/<SimName>/... for fatigue.json
+    let sim_dir = root.join("simulation");
+    if let Ok(entries) = std::fs::read_dir(sim_dir) {
+        let mut latest_fatigue: Option<(std::time::SystemTime, PathBuf)> = None;
+
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Ok(sub_entries) = std::fs::read_dir(entry.path()) {
+                    for sub in sub_entries.flatten() {
+                        let p = sub.path();
+                        if p.to_string_lossy().ends_with("_solder_fatigue.json") {
+                            if let Ok(meta) = p.metadata() {
+                                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                if latest_fatigue.is_none() || mtime > latest_fatigue.as_ref().unwrap().0 {
+                                    latest_fatigue = Some((mtime, p));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some((_, p)) = latest_fatigue {
+            status.fatigue_json = Some(p.to_string_lossy().to_string());
+            let pcres = p.to_string_lossy().replace("_solder_fatigue.json", "_creep.pcres");
+            if Path::new(&pcres).exists() {
+                status.creep_pcres = Some(pcres);
+            }
+        }
+    }
+
+    Ok(status)
+}
+
 
 // ─── Import (CVG → GLB) ───────────────────────────────────────────────────────
 
@@ -250,16 +377,17 @@ async fn check_model_exists() -> bool {
 /// dev-server path `/model.glb` continues to work during development.
 /// Returns the session GLB path.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn run_import(
     app:        AppHandle,
-    cvg_path:   String,
-    session_id: String,
+    cvgPath:    String,
+    sessionId:  String,
 ) -> Result<String, String> {
-    let models_dir = appdata_root().join(&session_id).join("models");
+    let models_dir = appdata_root().join(&sessionId).join("models");
     std::fs::create_dir_all(&models_dir)
         .map_err(|e| format!("Cannot create models dir: {e}"))?;
 
-    let board_stem = board_stem(&cvg_path);
+    let board_stem = board_stem(&cvgPath);
     let glb_path   = models_dir.join(format!("{board_stem}.glb"));
     let glb_str    = glb_path.to_string_lossy().to_string();
 
@@ -268,7 +396,7 @@ async fn run_import(
     let bin = find_bin("gltf_convertor")
         .ok_or_else(|| "gltf_convertor binary not found".to_string())?;
 
-    run_streamed(&app, "import", &bin, &[&cvg_path, "--glb", &glb_str], None)?;
+    run_streamed(&app, "import", &bin, &[&cvgPath, "--glb", &glb_str], None)?;
 
     // Dev-mode compat: Viewer3D loads from `/model.glb` served by the Vite dev
     // server out of frontend/public/.  Copy the generated file there so the 3D
@@ -279,6 +407,7 @@ async fn run_import(
         std::fs::copy(&glb_path, &pub_glb).ok();
     }
 
+    save_last_session(&sessionId);
     Ok(glb_str)
 }
 
@@ -286,6 +415,7 @@ async fn run_import(
 
 /// Result of run_generate_pc.
 #[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct GeneratePcResult {
     pcprep_path:    String,
     config_path:    String,
@@ -297,17 +427,18 @@ struct GeneratePcResult {
 /// config_json — serialised PointCloudSettings JSON (empty string = use defaults)
 /// Returns paths to the generated .pcprep / config / materials files.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn run_generate_pc(
     app:        AppHandle,
-    cvg_path:   String,
-    config_json: String,
-    session_id: String,
+    cvgPath:    String,
+    configJson: String,
+    sessionId:  String,
 ) -> Result<GeneratePcResult, String> {
-    let pc_dir = appdata_root().join(&session_id).join("point_cloud");
+    let pc_dir = appdata_root().join(&sessionId).join("point_cloud");
     std::fs::create_dir_all(&pc_dir)
         .map_err(|e| format!("Cannot create point_cloud dir: {e}"))?;
 
-    let board_stem   = board_stem(&cvg_path);
+    let board_stem   = board_stem(&cvgPath);
     let out_base     = pc_dir.join(&board_stem);
     let out_base_str = out_base.to_string_lossy().to_string();
 
@@ -318,22 +449,22 @@ async fn run_generate_pc(
 
     emit(&app, "generate_pc", "Generating RPIM point cloud…", false, None);
 
-    if config_json.trim().is_empty() {
+    if configJson.trim().is_empty() {
         // No config — let rpim_pc use its defaults
         run_streamed(
             &app, "generate_pc", &bin,
-            &[&cvg_path, "--out", &out_base_str],
+            &[&cvgPath, "--out", &out_base_str],
             Some(&log_path),
         )?;
     } else {
         // Write the config JSON next to the pcprep output
         let json_path    = pc_dir.join(format!("{board_stem}_rpim_input.json"));
         let json_path_str = json_path.to_string_lossy().to_string();
-        std::fs::write(&json_path, &config_json)
+        std::fs::write(&json_path, &configJson)
             .map_err(|e| format!("Cannot write rpim_input.json: {e}"))?;
         run_streamed(
             &app, "generate_pc", &bin,
-            &[&cvg_path, &json_path_str, "--out", &out_base_str],
+            &[&cvgPath, &json_path_str, "--out", &out_base_str],
             Some(&log_path),
         )?;
     }
@@ -367,6 +498,7 @@ struct PcsimParams {
 /// so the file is portable if the session folder is moved.
 /// Returns the absolute path of the written .pcsim.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn write_pcsim_file(params: PcsimParams) -> Result<String, String> {
     let sim_dir = appdata_root()
         .join(&params.session_id)
@@ -438,16 +570,17 @@ fn relative_path(base_dir: &Path, target: &Path) -> String {
 /// Outputs land in the same simulation folder; log written to rpim_solver.log.
 /// Returns path to the solder_fatigue.json result.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn run_solver(
     app:        AppHandle,
-    pcsim_path: String,
-    session_id: String,
-    sim_name:   String,
+    pcsimPath:  String,
+    sessionId:  String,
+    simName:    String,
 ) -> Result<String, String> {
     let sim_dir = appdata_root()
-        .join(&session_id)
+        .join(&sessionId)
         .join("simulation")
-        .join(&sim_name);
+        .join(&simName);
     std::fs::create_dir_all(&sim_dir)
         .map_err(|e| format!("Cannot create simulation dir: {e}"))?;
 
@@ -461,12 +594,12 @@ async fn run_solver(
 
     run_streamed(
         &app, "solver", &bin,
-        &[&pcsim_path, "--out-dir", &sim_dir_str],
+        &[&pcsimPath, "--out-dir", &sim_dir_str],
         Some(&log_path),
     )?;
 
     // Find the fatigue JSON — solver names it <stem>_solder_fatigue.json
-    let stem = Path::new(&pcsim_path)
+    let stem = Path::new(&pcsimPath)
         .file_stem().unwrap_or_default()
         .to_string_lossy().to_string();
     Ok(format!("{sim_dir_str}/{stem}_solder_fatigue.json"))
@@ -474,6 +607,7 @@ async fn run_solver(
 
 /// Result returned by run_solver_auto.
 #[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct SolverAutoResult {
     fatigue_path: String,
     pcprep_path:  String,
@@ -481,18 +615,19 @@ struct SolverAutoResult {
 
 /// Auto-generate pcprep with defaults + run solver; used for "quick solve" flow.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn run_solver_auto(
     app:        AppHandle,
-    cvg_path:   String,
-    session_id: String,
-    sim_name:   String,
+    cvgPath:    String,
+    sessionId:  String,
+    simName:    String,
 ) -> Result<SolverAutoResult, String> {
     // ── Step 1: point cloud ───────────────────────────────────────────────────
-    let pc_dir = appdata_root().join(&session_id).join("point_cloud");
+    let pc_dir = appdata_root().join(&sessionId).join("point_cloud");
     std::fs::create_dir_all(&pc_dir)
         .map_err(|e| format!("Cannot create point_cloud dir: {e}"))?;
 
-    let board_stem   = board_stem(&cvg_path);
+    let board_stem   = board_stem(&cvgPath);
     let out_base     = pc_dir.join(&board_stem);
     let out_base_str = out_base.to_string_lossy().to_string();
     let pc_log       = pc_dir.join("rpim_pc.log");
@@ -503,7 +638,7 @@ async fn run_solver_auto(
     emit(&app, "generate_pc", "Auto-generating RPIM point cloud…", false, None);
     run_streamed(
         &app, "generate_pc", &pc_bin,
-        &[&cvg_path, "--out", &out_base_str],
+        &[&cvgPath, "--out", &out_base_str],
         Some(&pc_log),
     )?;
 
@@ -514,11 +649,11 @@ async fn run_solver_auto(
 
     // ── Step 2: write default pcsim ───────────────────────────────────────────
     let sim_dir = appdata_root()
-        .join(&session_id).join("simulation").join(&sim_name);
+        .join(&sessionId).join("simulation").join(&simName);
     std::fs::create_dir_all(&sim_dir)
         .map_err(|e| format!("Cannot create simulation dir: {e}"))?;
 
-    let pcsim_path = sim_dir.join(format!("{sim_name}.pcsim"));
+    let pcsim_path = sim_dir.join(format!("{simName}.pcsim"));
     let pcprep_rel = relative_path(&sim_dir, Path::new(&pcprep_path));
     // TC-B default profile: -55 → +125°C
     let default_pts = vec![
@@ -547,7 +682,7 @@ async fn run_solver_auto(
     )?;
 
     Ok(SolverAutoResult {
-        fatigue_path: format!("{sim_dir_str}/{sim_name}_solder_fatigue.json"),
+        fatigue_path: format!("{sim_dir_str}/{simName}_solder_fatigue.json"),
         pcprep_path:  pcprep_path,
     })
 }
@@ -556,6 +691,7 @@ async fn run_solver_auto(
 
 /// Read any text/JSON file from disk and return its contents as a string.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn read_json_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {path}: {e}"))
@@ -563,13 +699,15 @@ async fn read_json_file(path: String) -> Result<String, String> {
 
 /// One node from the *PCB_POINT_CLOUD section of a .pcprep file.
 #[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct TraceNode { x: f32, y: f32, z: f32, metal_fraction: f32 }
 
 /// Parse the *PCB_POINT_CLOUD section from a .pcprep file (trace-map view).
 #[tauri::command]
-async fn read_trace_map(pcprep_path: String) -> Result<Vec<TraceNode>, String> {
-    let content = std::fs::read_to_string(&pcprep_path)
-        .map_err(|e| format!("Cannot read {pcprep_path}: {e}"))?;
+#[allow(non_snake_case)]
+async fn read_trace_map(pcprepPath: String) -> Result<Vec<TraceNode>, String> {
+    let content = std::fs::read_to_string(&pcprepPath)
+        .map_err(|e| format!("Cannot read {pcprepPath}: {e}"))?;
 
     let mut nodes: Vec<TraceNode> = Vec::new();
     let mut in_block = false;
@@ -604,7 +742,7 @@ const FTYPE_U32:     u8 = 1;
 const FTYPE_STR:     u8 = 2;
 
 #[derive(serde::Serialize, Clone)]
-#[serde(tag = "type")]
+#[serde(tag = "type", rename_all = "camelCase")]
 enum PcresRecord {
     Creep {
         node_id: u32, body_name: String,
@@ -624,6 +762,7 @@ enum PcresRecord {
 /// Solder joints are a small fraction; this avoids transferring millions of records
 /// over IPC when only the ΔW / displacement contour on solder joints is needed.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn read_pcres_solder(path: String) -> Result<Vec<PcresRecord>, String> {
     let all = read_pcres_data(&path)?;
     Ok(all.into_iter().filter(|r| {
@@ -634,6 +773,7 @@ async fn read_pcres_solder(path: String) -> Result<Vec<PcresRecord>, String> {
 
 /// Parse a `.pcres` binary file and return all records as JSON-serialisable values.
 #[tauri::command]
+#[allow(non_snake_case)]
 async fn read_pcres(path: String) -> Result<Vec<PcresRecord>, String> {
     read_pcres_data(&path)
 }
@@ -642,17 +782,15 @@ fn read_pcres_data(path: &str) -> Result<Vec<PcresRecord>, String> {
     let data = std::fs::read(path)
         .map_err(|e| format!("Cannot read '{path}': {e}"))?;
 
-    let mut pos = 0usize;
+    if data.get(..8) != Some(PCRES_MAGIC.as_slice()) {
+        return Err("Not a valid PCRES file (bad magic)".into());
+    }
+    let mut pos = 8usize;
 
     macro_rules! read_u8  { () => {{ let v = data[pos]; pos += 1; v }} }
     macro_rules! read_u16 { () => {{ let v = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap()); pos += 2; v }} }
     macro_rules! read_u32 { () => {{ let v = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()); pos += 4; v }} }
     macro_rules! read_f32 { () => {{ let v = f32::from_le_bytes(data[pos..pos+4].try_into().unwrap()); pos += 4; v }} }
-
-    if data.get(..8) != Some(PCRES_MAGIC.as_slice()) {
-        return Err("Not a valid PCRES file (bad magic)".into());
-    }
-    pos = 8;
 
     let result_type = read_u8!();
     let field_count = read_u8!() as usize;
@@ -748,9 +886,12 @@ fn board_stem(cvg_path: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             new_session,
             session_dirs,
+            get_startup_session,
+            get_session_status,
             pick_file,
             check_model_exists,
             run_import,
