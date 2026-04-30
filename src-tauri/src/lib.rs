@@ -698,11 +698,16 @@ async fn read_json_file(path: String) -> Result<String, String> {
 }
 
 /// One node from the *PCB_POINT_CLOUD section of a .pcprep file.
+/// Data format (comma-separated): x_mm,y_mm,z_mm,metal_fraction,face_tag
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct TraceNode { x: f32, y: f32, z: f32, metal_fraction: f32 }
+struct TraceNode { x: f32, y: f32, z: f32, metal_fraction: f32, face_tag: String }
 
-/// Parse the *PCB_POINT_CLOUD section from a .pcprep file (trace-map view).
+/// Parse ALL *PCB_POINT_CLOUD sections from a .pcprep file.
+///
+/// The pcprep has one section per copper layer (TOP, BOTTOM, INT1…INTn).
+/// Each data line is comma-separated: x_mm,y_mm,z_mm,metal_fraction,face_tag
+/// Comments are prefixed with `$`.
 #[tauri::command]
 #[allow(non_snake_case)]
 async fn read_trace_map(pcprepPath: String) -> Result<Vec<TraceNode>, String> {
@@ -710,23 +715,120 @@ async fn read_trace_map(pcprepPath: String) -> Result<Vec<TraceNode>, String> {
         .map_err(|e| format!("Cannot read {pcprepPath}: {e}"))?;
 
     let mut nodes: Vec<TraceNode> = Vec::new();
-    let mut in_block = false;
+    let mut in_pcb_cloud = false;
 
     for line in content.lines() {
         let t = line.trim();
-        if t.to_ascii_uppercase().starts_with("*PCB_POINT_CLOUD") {
-            in_block = true; continue;
+        // $ is the comment character in the pcprep format
+        if t.is_empty() || t.starts_with('$') || t.starts_with('#') { continue; }
+
+        if t.starts_with('*') {
+            // Re-evaluate which section we're in on every header line.
+            // Multiple *PCB_POINT_CLOUD sections exist (one per copper layer).
+            in_pcb_cloud = t.to_ascii_uppercase().starts_with("*PCB_POINT_CLOUD");
+            continue;
         }
-        if in_block {
-            if t.starts_with('*') { break; }
-            if t.is_empty() || t.starts_with('#') || t.starts_with("//") { continue; }
-            let p: Vec<&str> = t.split_whitespace().collect();
-            if p.len() >= 4 {
-                if let (Ok(x), Ok(y), Ok(z), Ok(mf)) = (
-                    p[0].parse::<f32>(), p[1].parse::<f32>(),
-                    p[2].parse::<f32>(), p[3].parse::<f32>(),
-                ) { nodes.push(TraceNode { x, y, z, metal_fraction: mf }); }
+
+        if !in_pcb_cloud { continue; }
+
+        // Comma-separated: x_mm,y_mm,z_mm,metal_fraction[,face_tag]
+        let p: Vec<&str> = t.split(',').collect();
+        if p.len() >= 4 {
+            if let (Ok(x), Ok(y), Ok(z), Ok(mf)) = (
+                p[0].trim().parse::<f32>(), p[1].trim().parse::<f32>(),
+                p[2].trim().parse::<f32>(), p[3].trim().parse::<f32>(),
+            ) {
+                let face_tag = p.get(4).map(|s| s.trim().to_string()).unwrap_or_else(|| "V".to_string());
+                nodes.push(TraceNode { x, y, z, metal_fraction: mf, face_tag });
             }
+        }
+    }
+    Ok(nodes)
+}
+
+/// One node from any body section of a .pcprep file (components, solder, PCB layers).
+/// Used for the full structural point-cloud view after mesh generation.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PcprepNode { x: f32, y: f32, z: f32, body_name: String, face_tag: String }
+
+/// Extract the BODY="..." attribute from a *POINT_CLOUD header line.
+fn extract_body_attr(header: &str) -> String {
+    // Finds  BODY="some_name"  in the header string
+    if let Some(pos) = header.to_ascii_uppercase().find("BODY=\"") {
+        let rest = &header[pos + 6..];
+        if let Some(end) = rest.find('"') {
+            return rest[..end].to_string();
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Parse ALL point-cloud body sections from a .pcprep file.
+///
+/// Reads two section types:
+///   *PCB_POINT_CLOUD, LAYER_NAME="..."  — PCB copper layer nodes
+///       data: x_mm,y_mm,z_mm,metal_fraction,face_tag
+///   *POINT_CLOUD, BODY="comp_...", MATERIAL="..."  — component / solder nodes
+///       data: x_mm,y_mm,z_mm,face_tag
+///
+/// Returns all nodes with body_name and face_tag for body-colour rendering.
+#[tauri::command]
+#[allow(non_snake_case)]
+async fn read_pcprep_all_nodes(pcprepPath: String) -> Result<Vec<PcprepNode>, String> {
+    let content = std::fs::read_to_string(&pcprepPath)
+        .map_err(|e| format!("Cannot read {pcprepPath}: {e}"))?;
+
+    let mut nodes: Vec<PcprepNode> = Vec::new();
+    let mut body_name  = String::new();
+    let mut is_pcb     = false;   // PCB layers have an extra metal_fraction column
+    let mut in_section = false;
+
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('$') || t.starts_with('#') { continue; }
+
+        if t.starts_with('*') {
+            let upper = t.to_ascii_uppercase();
+            if upper.starts_with("*PCB_POINT_CLOUD") {
+                // Use the layer name as the body identifier
+                body_name = if let Some(pos) = upper.find("LAYER_NAME=\"") {
+                    let rest = &t[pos + 12..];
+                    let end  = rest.find('"').unwrap_or(rest.len());
+                    format!("PCB_{}", &rest[..end])
+                } else {
+                    "PCB_substrate".to_string()
+                };
+                is_pcb     = true;
+                in_section = true;
+            } else if upper.starts_with("*POINT_CLOUD") && upper.contains("BODY=") {
+                body_name  = extract_body_attr(t);
+                is_pcb     = false;
+                in_section = true;
+            } else {
+                in_section = false;
+            }
+            continue;
+        }
+
+        if !in_section || body_name.is_empty() { continue; }
+
+        let p: Vec<&str> = t.split(',').collect();
+        if p.len() < 3 { continue; }
+
+        if let (Ok(x), Ok(y), Ok(z)) = (
+            p[0].trim().parse::<f32>(),
+            p[1].trim().parse::<f32>(),
+            p[2].trim().parse::<f32>(),
+        ) {
+            // PCB:  x,y,z,metal_fraction,face_tag  → face_tag at index 4
+            // Body: x,y,z,face_tag                 → face_tag at index 3
+            let face_tag = if is_pcb {
+                p.get(4).map(|s| s.trim().to_string()).unwrap_or_else(|| "V".to_string())
+            } else {
+                p.get(3).map(|s| s.trim().to_string()).unwrap_or_else(|| "V".to_string())
+            };
+            nodes.push(PcprepNode { x, y, z, body_name: body_name.clone(), face_tag });
         }
     }
     Ok(nodes)
@@ -901,6 +1003,7 @@ pub fn run() {
             run_solver_auto,
             read_json_file,
             read_trace_map,
+            read_pcprep_all_nodes,
             read_pcres,
             read_pcres_solder,
         ])
