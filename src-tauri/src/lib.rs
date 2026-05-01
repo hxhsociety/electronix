@@ -20,7 +20,7 @@
 //   read_trace_map         → parse *PCB_POINT_CLOUD from .pcprep
 //   read_pcres             → parse binary .pcres result file
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -192,51 +192,92 @@ fn emit(app: &AppHandle, step: &str, line: &str, done: bool, error: Option<Strin
     });
 }
 
-/// Run a binary, stream every stdout line as a progress event, and write a log file.
+/// Run a binary, stream every stdout/stderr line as a progress event,
+/// write each line to the log file immediately (not batched), and optionally
+/// set the working directory.
+///
+/// Fixes vs. old implementation:
+///   - log is written line-by-line so it is always up-to-date even if the
+///     process hangs (previously the file was only written after exit)
+///   - stderr is drained in a second thread so a large stderr burst can't
+///     block the process or the main thread
+///   - `work_dir` lets callers set CWD so relative *INCLUDE paths in .pcsim
+///     files resolve correctly (relative to the .pcsim location, not to the
+///     Tauri process CWD)
 fn run_streamed(
     app:      &AppHandle,
     step:     &str,
     bin:      &Path,
     args:     &[&str],
     log_path: Option<&Path>,
+    work_dir: Option<&Path>,
 ) -> Result<(), String> {
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let mut cmd = Command::new(bin);
+    cmd.args(args)
+       .stdout(Stdio::piped())
+       .stderr(Stdio::piped());
+    if let Some(wd) = work_dir {
+        cmd.current_dir(wd);
+    }
+    let mut child = cmd.spawn()
         .map_err(|e| format!("Failed to start {}: {e}", bin.display()))?;
 
-    let log_buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let log_buf2  = Arc::clone(&log_buf);
-    let app2      = app.clone();
-    let step_str  = step.to_string();
-    let stdout    = child.stdout.take().unwrap();
+    // Open the log file immediately so lines are flushed as the process runs.
+    // Use Arc<Mutex<File>> so both stdout and stderr threads can write to it.
+    let log_file: Option<Arc<Mutex<std::fs::File>>> = log_path.and_then(|lp| {
+        std::fs::File::create(lp)
+            .map_err(|e| eprintln!("Cannot create log {}: {e}", lp.display()))
+            .ok()
+            .map(|f| Arc::new(Mutex::new(f)))
+    });
 
-    let handle = std::thread::spawn(move || {
+    // ── Thread 1: drain stdout → emit progress events + write log ────────
+    let log1     = log_file.clone();
+    let app1     = app.clone();
+    let step1    = step.to_string();
+    let stdout   = child.stdout.take().unwrap();
+
+    let h_stdout = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().flatten() {
-            emit(&app2, &step_str, &line, false, None);
-            log_buf2.lock().unwrap().push(line);
+            emit(&app1, &step1, &line, false, None);
+            if let Some(ref f) = log1 {
+                let _ = writeln!(f.lock().unwrap(), "{line}");
+            }
         }
     });
 
-    let stderr_out = {
-        let stderr = child.stderr.take().unwrap();
+    // ── Thread 2: drain stderr → emit progress events + write log ─────────
+    let log2     = log_file.clone();
+    let app2     = app.clone();
+    let step2    = step.to_string();
+    let stderr   = child.stderr.take().unwrap();
+
+    let h_stderr = std::thread::spawn(move || {
         let mut buf = String::new();
         for line in BufReader::new(stderr).lines().flatten() {
+            // Prefix stderr lines so they're visible in the UI log
+            emit(&app2, &step2, &format!("[err] {line}"), false, None);
             buf.push_str(&line);
             buf.push('\n');
+            if let Some(ref f) = log2 {
+                let _ = writeln!(f.lock().unwrap(), "[ERR] {line}");
+            }
         }
         buf
-    };
+    });
 
-    let _ = handle.join();
+    // ── Wait for both I/O threads, then reap the process ──────────────────
+    let _ = h_stdout.join();
+    let stderr_out = h_stderr.join().unwrap_or_default();
     let status = child.wait().map_err(|e| e.to_string())?;
 
-    if let Some(lp) = log_path {
-        let lines = log_buf.lock().unwrap();
-        let content = format!("{}\n{}", lines.join("\n"), stderr_out.trim());
-        let _ = std::fs::write(lp, content);
+    // Flush a final separator to the log so partial runs are obvious
+    if let Some(ref f) = log_file {
+        let _ = writeln!(
+            f.lock().unwrap(),
+            "\n--- exit code: {:?} ---",
+            status.code()
+        );
     }
 
     if status.success() {
@@ -396,7 +437,7 @@ async fn run_import(
     let bin = find_bin("gltf_convertor")
         .ok_or_else(|| "gltf_convertor binary not found".to_string())?;
 
-    run_streamed(&app, "import", &bin, &[&cvgPath, "--glb", &glb_str], None)?;
+    run_streamed(&app, "import", &bin, &[&cvgPath, "--glb", &glb_str], None, None)?;
 
     // Dev-mode compat: Viewer3D loads from `/model.glb` served by the Vite dev
     // server out of frontend/public/.  Copy the generated file there so the 3D
@@ -455,6 +496,7 @@ async fn run_generate_pc(
             &app, "generate_pc", &bin,
             &[&cvgPath, "--out", &out_base_str],
             Some(&log_path),
+            Some(pc_dir.as_path()),   // run from pc_dir so relative paths resolve
         )?;
     } else {
         // Write the config JSON next to the pcprep output
@@ -466,6 +508,7 @@ async fn run_generate_pc(
             &app, "generate_pc", &bin,
             &[&cvgPath, &json_path_str, "--out", &out_base_str],
             Some(&log_path),
+            Some(pc_dir.as_path()),
         )?;
     }
 
@@ -592,10 +635,13 @@ async fn run_solver(
     let bin = find_bin("rpim_solver")
         .ok_or_else(|| "rpim_solver binary not found".to_string())?;
 
+    // ── IMPORTANT: set CWD to sim_dir so *INCLUDE paths in the .pcsim
+    //    (written as relative paths to the pcprep) resolve correctly.
     run_streamed(
         &app, "solver", &bin,
         &[&pcsimPath, "--out-dir", &sim_dir_str],
         Some(&log_path),
+        Some(sim_dir.as_path()),
     )?;
 
     // Find the fatigue JSON — solver names it <stem>_solder_fatigue.json
@@ -640,6 +686,7 @@ async fn run_solver_auto(
         &app, "generate_pc", &pc_bin,
         &[&cvgPath, "--out", &out_base_str],
         Some(&pc_log),
+        Some(pc_dir.as_path()),
     )?;
 
     let pcprep_path = format!("{out_base_str}.pcprep");
@@ -679,6 +726,7 @@ async fn run_solver_auto(
         &app, "solver", &solver_bin,
         &[&pcsim_str, "--out-dir", &sim_dir_str],
         Some(&solver_log),
+        Some(sim_dir.as_path()),    // CWD = sim_dir so relative pcprep path resolves
     )?;
 
     Ok(SolverAutoResult {
