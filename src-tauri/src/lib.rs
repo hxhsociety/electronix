@@ -821,25 +821,42 @@ fn extract_body_attr(header: &str) -> String {
 ///       data: x_mm,y_mm,z_mm,face_tag
 ///
 /// Returns all nodes with body_name and face_tag for body-colour rendering.
+///
+/// `max_nodes` — optional upper bound on returned nodes (default: unlimited).
+/// When set, PCB layer nodes are always kept in full; body (solder / component)
+/// nodes are stride-sampled so the total stays within the limit.  This keeps
+/// transfer sizes sane for large assemblies (~3 M-node meshes) while retaining
+/// enough spatial resolution for visualisation (~60 k nodes is plenty for WebGL).
 #[tauri::command]
 #[allow(non_snake_case)]
-async fn read_pcprep_all_nodes(pcprepPath: String) -> Result<Vec<PcprepNode>, String> {
+async fn read_pcprep_all_nodes(
+    pcprepPath: String,
+    maxNodes:   Option<usize>,
+) -> Result<Vec<PcprepNode>, String> {
     let content = std::fs::read_to_string(&pcprepPath)
         .map_err(|e| format!("Cannot read {pcprepPath}: {e}"))?;
 
-    let mut nodes: Vec<PcprepNode> = Vec::new();
+    // ── First pass: collect all nodes ────────────────────────────────────────
+    let mut all_nodes: Vec<PcprepNode> = Vec::new();
+    // Track which nodes are PCB (always kept) vs body (may be strided)
+    let mut pcb_end: Vec<usize> = Vec::new();  // indices where a PCB section ends
+
     let mut body_name  = String::new();
-    let mut is_pcb     = false;   // PCB layers have an extra metal_fraction column
+    let mut is_pcb     = false;
     let mut in_section = false;
+    let mut cur_section_start = 0usize;
 
     for line in content.lines() {
         let t = line.trim();
         if t.is_empty() || t.starts_with('$') || t.starts_with('#') { continue; }
 
         if t.starts_with('*') {
+            // If we just finished a PCB section, record its end index
+            if is_pcb && in_section {
+                pcb_end.push(all_nodes.len());
+            }
             let upper = t.to_ascii_uppercase();
             if upper.starts_with("*PCB_POINT_CLOUD") {
-                // Use the layer name as the body identifier
                 body_name = if let Some(pos) = upper.find("LAYER_NAME=\"") {
                     let rest = &t[pos + 12..];
                     let end  = rest.find('"').unwrap_or(rest.len());
@@ -849,13 +866,17 @@ async fn read_pcprep_all_nodes(pcprepPath: String) -> Result<Vec<PcprepNode>, St
                 };
                 is_pcb     = true;
                 in_section = true;
+                cur_section_start = all_nodes.len();
             } else if upper.starts_with("*POINT_CLOUD") && upper.contains("BODY=") {
                 body_name  = extract_body_attr(t);
                 is_pcb     = false;
                 in_section = true;
+                cur_section_start = all_nodes.len();
             } else {
+                if is_pcb && in_section { pcb_end.push(all_nodes.len()); }
                 in_section = false;
             }
+            let _ = cur_section_start;
             continue;
         }
 
@@ -869,17 +890,62 @@ async fn read_pcprep_all_nodes(pcprepPath: String) -> Result<Vec<PcprepNode>, St
             p[1].trim().parse::<f32>(),
             p[2].trim().parse::<f32>(),
         ) {
-            // PCB:  x,y,z,metal_fraction,face_tag  → face_tag at index 4
-            // Body: x,y,z,face_tag                 → face_tag at index 3
             let face_tag = if is_pcb {
                 p.get(4).map(|s| s.trim().to_string()).unwrap_or_else(|| "V".to_string())
             } else {
                 p.get(3).map(|s| s.trim().to_string()).unwrap_or_else(|| "V".to_string())
             };
-            nodes.push(PcprepNode { x, y, z, body_name: body_name.clone(), face_tag });
+            all_nodes.push(PcprepNode { x, y, z, body_name: body_name.clone(), face_tag });
         }
     }
-    Ok(nodes)
+    // Capture last section if it was PCB
+    if is_pcb && in_section { pcb_end.push(all_nodes.len()); }
+
+    // ── Subsampling ──────────────────────────────────────────────────────────
+    let limit = match maxNodes {
+        Some(n) if n > 0 && n < all_nodes.len() => n,
+        _ => return Ok(all_nodes),   // no limit — return everything
+    };
+
+    // Build a bitset marking PCB nodes (always kept)
+    let mut is_pcb_node = vec![false; all_nodes.len()];
+    {
+        // pcb_end contains the exclusive end indices of each PCB section.
+        // We need the start of each section too.  Re-derive from the vec:
+        // PCB sections are all nodes BEFORE the first non-PCB node in each block.
+        // Simpler: just mark every node whose body_name starts with "PCB_"
+        for (i, n) in all_nodes.iter().enumerate() {
+            if n.body_name.starts_with("PCB_") {
+                is_pcb_node[i] = true;
+            }
+        }
+    }
+    let pcb_count  = is_pcb_node.iter().filter(|&&b| b).count();
+    let body_count = all_nodes.len() - pcb_count;
+
+    // How many body nodes can we keep?
+    let body_budget = limit.saturating_sub(pcb_count).max(0);
+    let stride = if body_count > 0 && body_budget < body_count {
+        ((body_count as f64) / (body_budget as f64)).ceil() as usize
+    } else {
+        1
+    };
+
+    let mut result: Vec<PcprepNode> = Vec::with_capacity(limit);
+    let mut body_idx = 0usize;
+
+    for (i, node) in all_nodes.into_iter().enumerate() {
+        if is_pcb_node[i] {
+            result.push(node);
+        } else {
+            if body_idx % stride == 0 {
+                result.push(node);
+            }
+            body_idx += 1;
+        }
+    }
+
+    Ok(result)
 }
 
 // ─── .pcres reader ────────────────────────────────────────────────────────────
