@@ -219,6 +219,15 @@ fn run_streamed(
     if let Some(wd) = work_dir {
         cmd.current_dir(wd);
     }
+    // On Windows, CREATE_NO_WINDOW prevents the child from allocating a console.
+    // Without this, console host (conhost.exe) can hold the write end of the pipe
+    // open after the child exits, causing BufReader::lines() to block forever.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     let mut child = cmd.spawn()
         .map_err(|e| format!("Failed to start {}: {e}", bin.display()))?;
 
@@ -608,18 +617,31 @@ fn relative_path(base_dir: &Path, target: &Path) -> String {
 
 // ─── Solver ───────────────────────────────────────────────────────────────────
 
+/// Event emitted when the solver background thread finishes (success or error).
+/// The frontend listens for this instead of awaiting the long-running invoke.
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SolverDonePayload {
+    sim_id:       String,          // echoed back so the frontend can match the case
+    session_id:   String,
+    fatigue_path: Option<String>,  // Some on success, None on error
+    pcprep_path:  Option<String>,  // Some when auto-generated, None for explicit solve
+    error:        Option<String>,
+}
+
 /// Run rpim_solver on a .pcsim file inside `session/simulation/<sim_name>/`.
 ///
-/// Outputs land in the same simulation folder; log written to rpim_solver.log.
-/// Returns path to the solder_fatigue.json result.
+/// Returns immediately after spawning the solver thread.
+/// Emits "solver://done" when the thread finishes (success or error).
 #[tauri::command]
 #[allow(non_snake_case)]
 async fn run_solver(
     app:        AppHandle,
+    simId:      String,
     pcsimPath:  String,
     sessionId:  String,
     simName:    String,
-) -> Result<String, String> {
+) -> Result<(), String> {
     let sim_dir = appdata_root()
         .join(&sessionId)
         .join("simulation")
@@ -630,45 +652,56 @@ async fn run_solver(
     let sim_dir_str = sim_dir.to_string_lossy().to_string();
     let log_path    = sim_dir.join("rpim_solver.log");
 
-    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
-
     let bin = find_bin("rpim_solver")
         .ok_or_else(|| "rpim_solver binary not found".to_string())?;
 
-    // ── IMPORTANT: set CWD to sim_dir so *INCLUDE paths in the .pcsim
-    //    (written as relative paths to the pcprep) resolve correctly.
-    run_streamed(
-        &app, "solver", &bin,
-        &[&pcsimPath, "--out-dir", &sim_dir_str],
-        Some(&log_path),
-        Some(sim_dir.as_path()),
-    )?;
-
-    // Find the fatigue JSON — solver names it <stem>_solder_fatigue.json
     let stem = Path::new(&pcsimPath)
         .file_stem().unwrap_or_default()
         .to_string_lossy().to_string();
-    Ok(format!("{sim_dir_str}/{stem}_solder_fatigue.json"))
-}
+    let expected_fatigue = format!("{sim_dir_str}/{stem}_solder_fatigue.json");
 
-/// Result returned by run_solver_auto.
-#[derive(serde::Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct SolverAutoResult {
-    fatigue_path: String,
-    pcprep_path:  String,
+    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
+
+    // ── Fire-and-forget: solver runs in a background OS thread ───────────────
+    // We do NOT await run_streamed here.  Blocking an async Tauri command for
+    // 30+ minutes prevents the IPC channel from returning, so the frontend
+    // `invoke()` never resolves and the UI stays stuck at "running".
+    std::thread::spawn(move || {
+        let result = run_streamed(
+            &app, "solver", &bin,
+            &[&pcsimPath, "--out-dir", &sim_dir_str],
+            Some(&log_path),
+            Some(sim_dir.as_path()),
+        );
+        let (fatigue, error) = match result {
+            Ok(_)  => (Some(expected_fatigue), None),
+            Err(e) => (None, Some(e)),
+        };
+        let _ = app.emit("solver://done", SolverDonePayload {
+            sim_id: simId, session_id: sessionId,
+            fatigue_path: fatigue, pcprep_path: None, error,
+        });
+    });
+
+    Ok(())  // frontend invoke() returns immediately; solver runs in background
 }
 
 /// Auto-generate pcprep with defaults + run solver; used for "quick solve" flow.
+///
+/// rpim_pc (fast, ~10–30 s) runs synchronously so we know if it succeeded.
+/// rpim_solver (slow, minutes–hours) runs in a background thread.
+/// Returns immediately after the point-cloud step and emits "solver://done"
+/// when the solver thread finishes.
 #[tauri::command]
 #[allow(non_snake_case)]
 async fn run_solver_auto(
     app:        AppHandle,
+    simId:      String,
     cvgPath:    String,
     sessionId:  String,
     simName:    String,
-) -> Result<SolverAutoResult, String> {
-    // ── Step 1: point cloud ───────────────────────────────────────────────────
+) -> Result<String, String> {   // returns pcprep path (useful for immediate UI update)
+    // ── Step 1: point cloud (synchronous — fast) ──────────────────────────────
     let pc_dir = appdata_root().join(&sessionId).join("point_cloud");
     std::fs::create_dir_all(&pc_dir)
         .map_err(|e| format!("Cannot create point_cloud dir: {e}"))?;
@@ -694,7 +727,7 @@ async fn run_solver_auto(
         return Err(format!("rpim_pc did not produce {pcprep_path}"));
     }
 
-    // ── Step 2: write default pcsim ───────────────────────────────────────────
+    // ── Step 2: write default pcsim (synchronous) ─────────────────────────────
     let sim_dir = appdata_root()
         .join(&sessionId).join("simulation").join(&simName);
     std::fs::create_dir_all(&sim_dir)
@@ -702,7 +735,6 @@ async fn run_solver_auto(
 
     let pcsim_path = sim_dir.join(format!("{simName}.pcsim"));
     let pcprep_rel = relative_path(&sim_dir, Path::new(&pcprep_path));
-    // TC-B default profile: -55 → +125°C
     let default_pts = vec![
         (0.0, 25.0), (6.0, -55.0), (21.0, -55.0),
         (34.0, 125.0), (49.0, 125.0), (56.0, 25.0),
@@ -713,26 +745,38 @@ async fn run_solver_auto(
     std::fs::write(&pcsim_path, &pcsim_text)
         .map_err(|e| format!("Cannot write auto .pcsim: {e}"))?;
 
-    // ── Step 3: solve ─────────────────────────────────────────────────────────
-    let sim_dir_str  = sim_dir.to_string_lossy().to_string();
-    let pcsim_str    = pcsim_path.to_string_lossy().to_string();
-    let solver_log   = sim_dir.join("rpim_solver.log");
+    // ── Step 3: solver in background thread ───────────────────────────────────
+    let sim_dir_str    = sim_dir.to_string_lossy().to_string();
+    let pcsim_str      = pcsim_path.to_string_lossy().to_string();
+    let solver_log     = sim_dir.join("rpim_solver.log");
+    let expected_fatigue = format!("{sim_dir_str}/{simName}_solder_fatigue.json");
+    let pcprep_for_evt = pcprep_path.clone();
 
     let solver_bin = find_bin("rpim_solver")
         .ok_or_else(|| "rpim_solver binary not found".to_string())?;
 
-    emit(&app, "solver", "Running RPIM creep + fatigue solver…", false, None);
-    run_streamed(
-        &app, "solver", &solver_bin,
-        &[&pcsim_str, "--out-dir", &sim_dir_str],
-        Some(&solver_log),
-        Some(sim_dir.as_path()),    // CWD = sim_dir so relative pcprep path resolves
-    )?;
+    emit(&app, "solver", "RPIM point cloud ready — solver running in background…", false, None);
 
-    Ok(SolverAutoResult {
-        fatigue_path: format!("{sim_dir_str}/{simName}_solder_fatigue.json"),
-        pcprep_path:  pcprep_path,
-    })
+    std::thread::spawn(move || {
+        let result = run_streamed(
+            &app, "solver", &solver_bin,
+            &[&pcsim_str, "--out-dir", &sim_dir_str],
+            Some(&solver_log),
+            Some(sim_dir.as_path()),
+        );
+        let (fatigue, error) = match result {
+            Ok(_)  => (Some(expected_fatigue), None),
+            Err(e) => (None, Some(e)),
+        };
+        let _ = app.emit("solver://done", SolverDonePayload {
+            sim_id: simId, session_id: sessionId,
+            fatigue_path: fatigue,
+            pcprep_path:  Some(pcprep_for_evt),
+            error,
+        });
+    });
+
+    Ok(pcprep_path)  // return pcprep path immediately so frontend can show body cloud
 }
 
 // ─── File utilities ───────────────────────────────────────────────────────────
