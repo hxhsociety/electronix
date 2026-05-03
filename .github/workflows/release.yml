@@ -1,0 +1,140 @@
+# ElectroniX — Release pipeline
+#
+# Triggers on:
+#   • Push of a version tag  →  v0.1.0, v1.2.3-beta.1, etc.
+#   • Manual workflow_dispatch (for testing without a tag)
+#
+# Produces:
+#   Windows  : ElectroniX_<ver>_x64-setup.exe  (NSIS installer)
+#   macOS    : ElectroniX_<ver>_aarch64.dmg + x64.dmg
+#   Linux    : ElectroniX_<ver>_amd64.AppImage + .deb
+#
+# Required secrets (Settings → Secrets → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY        ← output of `tauri signer generate`
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#   GITHUB_TOKEN                     ← automatically provided by Actions
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+jobs:
+  # ── Build matrix ─────────────────────────────────────────────────────────────
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x64
+          - platform: windows-latest
+            args: '--target x86_64-pc-windows-msvc'
+            rust_target: x86_64-pc-windows-msvc
+
+          # macOS Apple Silicon
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            rust_target: aarch64-apple-darwin
+
+          # macOS Intel
+          - platform: macos-latest
+            args: '--target x86_64-apple-darwin'
+            rust_target: x86_64-apple-darwin
+
+          # Linux x64
+          - platform: ubuntu-22.04
+            args: '--target x86_64-unknown-linux-gnu'
+            rust_target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 90
+
+    steps:
+      # ── Checkout (shallow, with submodules) ──────────────────────────────────
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # ── Install system deps (Linux only) ─────────────────────────────────────
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            pkg-config
+
+      # ── Rust toolchain ───────────────────────────────────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      # ── Rust cache ───────────────────────────────────────────────────────────
+      - name: Cache Rust / Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+          cache-on-failure: true
+
+      # ── Node + pnpm ──────────────────────────────────────────────────────────
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      # ── Tauri build + sign + package ─────────────────────────────────────────
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'ElectroniX ${{ github.ref_name }}'
+          releaseBody: |
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+
+            ### Quick start
+            1. Download the installer for your platform below.
+            2. Run the installer — no admin rights needed (current-user install on Windows).
+            3. Open ElectroniX, import your STEP/IDF board, run the solver.
+
+            > **Note:** Windows SmartScreen may show "Unknown Publisher" on first run.
+            > Click **More info → Run anyway** to proceed.
+          releaseDraft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          args: ${{ matrix.args }}
+          projectPath: '.'
+
+  # ── Generate update manifest (latest.json) ───────────────────────────────────
+  update_manifest:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download ${{ github.ref_name }} --dir ./release-assets || true
+
+      - name: List release assets
+        run: ls -la ./release-assets/ 2>/dev/null || echo "No assets downloaded"
