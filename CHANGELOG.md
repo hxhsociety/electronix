@@ -49,5 +49,5 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
-[Unreleased]: https://github.com/electronix-app/ElectroniX/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/electronix-app/ElectroniX/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Solaris/ElectroniX/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Solaris/ElectroniX/releases/tag/v0.1.0

@@ -7,8 +7,8 @@ Follow these steps **once** to wire up the automated release pipeline.
 ## 1. Create the GitHub repository
 
 ```bash
-# Create repo at github.com/electronix-app/ElectroniX (or your org)
-gh repo create electronix-app/ElectroniX --public --source=. --remote=origin
+# Create repo at github.com/Solaris/ElectroniX (or your org)
+gh repo create Solaris/ElectroniX --public --source=. --remote=origin
 git push -u origin main
 ```
 
@@ -87,7 +87,7 @@ GitHub Actions will:
 
 Tauri's updater fetches:
 ```
-https://github.com/electronix-app/ElectroniX/releases/latest/download/latest.json
+https://github.com/Solaris/ElectroniX/releases/latest/download/latest.json
 ```
 
 The `tauri-action` GitHub Action generates and uploads this file automatically
