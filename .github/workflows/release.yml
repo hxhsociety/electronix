@@ -30,7 +30,7 @@ jobs:
       matrix:
         include:
           # Windows x64
-          - platform: windows-latest
+          - platform: windows-2022
             args: '--target x86_64-pc-windows-msvc'
             rust_target: x86_64-pc-windows-msvc
 
@@ -71,6 +71,13 @@ jobs:
             patchelf \
             libssl-dev \
             pkg-config
+
+      # ── MSVC environment (Windows only) ──────────────────────────────────────
+      - name: Setup MSVC environment
+        if: matrix.platform == 'windows-2022'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       # ── Rust toolchain ───────────────────────────────────────────────────────
       - name: Install Rust stable
