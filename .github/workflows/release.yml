@@ -22,6 +22,9 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   # ── Build matrix ─────────────────────────────────────────────────────────────
   build:
