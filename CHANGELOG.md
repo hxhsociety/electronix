@@ -11,6 +11,15 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [0.1.1] — 2026-05-06
+
+### Fixed
+- **Sidecar binaries missing from installer.** Bundle now includes
+  `gltf_convertor`, `rpim_pc`, and `rpim_solver` so the helpers required by
+  IPC-2581 import and solver runs are present after install.
+
+---
+
 ## [0.1.0] — 2026-05-03
 
 ### Added

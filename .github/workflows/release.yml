@@ -107,6 +107,37 @@ jobs:
         run: npm ci
         working-directory: frontend
 
+      # ── Build helper CLIs as Tauri sidecars ──────────────────────────────────
+      # Tauri bundles `externalBin` files into the installer next to the main
+      # exe, but it expects each path to be suffixed with the target triple
+      # (e.g. binaries/gltf_convertor-x86_64-pc-windows-msvc.exe). We compile
+      # the workspace binaries here and copy them with the right names so the
+      # installer knows which copy to embed for each platform.
+      - name: Build workspace helper binaries
+        run: cargo build --release --workspace --target ${{ matrix.rust_target }}
+
+      - name: Stage sidecar binaries (Unix)
+        if: matrix.platform != 'windows-2022'
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          for bin in gltf_convertor rpim_pc rpim_solver; do
+            cp "target/${{ matrix.rust_target }}/release/${bin}" \
+               "src-tauri/binaries/${bin}-${{ matrix.rust_target }}"
+          done
+          ls -la src-tauri/binaries/
+
+      - name: Stage sidecar binaries (Windows)
+        if: matrix.platform == 'windows-2022'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
+          foreach ($bin in @('gltf_convertor', 'rpim_pc', 'rpim_solver')) {
+            Copy-Item "target/${{ matrix.rust_target }}/release/${bin}.exe" `
+                      "src-tauri/binaries/${bin}-${{ matrix.rust_target }}.exe"
+          }
+          Get-ChildItem src-tauri/binaries
+
       # ── Tauri build + sign + package ─────────────────────────────────────────
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
