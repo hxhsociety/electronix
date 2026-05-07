@@ -111,32 +111,49 @@ jobs:
       # Tauri bundles `externalBin` files into the installer next to the main
       # exe, but it expects each path to be suffixed with the target triple
       # (e.g. binaries/gltf_convertor-x86_64-pc-windows-msvc.exe). We compile
-      # the workspace binaries here and copy them with the right names so the
-      # installer knows which copy to embed for each platform.
+      # the three workspace binaries explicitly (faster and more reliable
+      # than --workspace which would also rebuild the tauri crate) and copy
+      # them with the right names. Each step is fail-fast so a missing binary
+      # surfaces immediately rather than during the tauri bundle stage.
       - name: Build workspace helper binaries
-        run: cargo build --release --workspace --target ${{ matrix.rust_target }}
+        run: |
+          cargo build --release --target ${{ matrix.rust_target }} -p gltf_convertor
+          cargo build --release --target ${{ matrix.rust_target }} -p rpim_pc
+          cargo build --release --target ${{ matrix.rust_target }} -p rpim_solver
 
       - name: Stage sidecar binaries (Unix)
         if: matrix.platform != 'windows-2022'
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p src-tauri/binaries
           for bin in gltf_convertor rpim_pc rpim_solver; do
-            cp "target/${{ matrix.rust_target }}/release/${bin}" \
-               "src-tauri/binaries/${bin}-${{ matrix.rust_target }}"
+            src="target/${{ matrix.rust_target }}/release/${bin}"
+            dst="src-tauri/binaries/${bin}-${{ matrix.rust_target }}"
+            test -f "$src" || { echo "::error::missing source: $src"; exit 1; }
+            cp "$src" "$dst"
+            chmod +x "$dst"
           done
+          echo "Staged sidecars:"
           ls -la src-tauri/binaries/
 
       - name: Stage sidecar binaries (Windows)
         if: matrix.platform == 'windows-2022'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path src-tauri/binaries | Out-Null
           foreach ($bin in @('gltf_convertor', 'rpim_pc', 'rpim_solver')) {
-            Copy-Item "target/${{ matrix.rust_target }}/release/${bin}.exe" `
-                      "src-tauri/binaries/${bin}-${{ matrix.rust_target }}.exe"
+            $src = "target/${{ matrix.rust_target }}/release/${bin}.exe"
+            $dst = "src-tauri/binaries/${bin}-${{ matrix.rust_target }}.exe"
+            if (-not (Test-Path $src)) {
+              Write-Error "missing source: $src"
+              exit 1
+            }
+            Copy-Item $src $dst -Force
           }
-          Get-ChildItem src-tauri/binaries
+          Write-Host "Staged sidecars:"
+          Get-ChildItem src-tauri/binaries | Format-Table Name, Length
 
       # ── Tauri build + sign + package ─────────────────────────────────────────
       - name: Build Tauri app
