@@ -1,0 +1,32 @@
+# Expected Nf for ElectroniX validation case 01.
+# Tolerance band per IPC-9701A guidance for life-prediction tools (±20%).
+
+case_id:    case_01_darveaux2000_pbga256
+package:    PBGA 256
+pitch_mm:   1.0
+ball_count: 256
+alloy:      SAC305
+
+paper:
+  authors:  "Darveaux, R."
+  year:     2000
+  title:    "Effect of Rate of Change of Temperature on Solder Joint Fatigue"
+  venue:    "Proc. ASME InterPACK 2000"
+
+thermal_cycle:
+  profile:    JEDEC TC1
+  t_low_c:    0.0
+  t_high_c:   100.0
+  ramp_min:   15.0
+  dwell_min:  15.0
+  cph:        2          # cycles per hour
+
+reported:
+  Nf_eta:     6500       # Weibull characteristic life [cycles]
+  Nf_beta:    4.5        # Weibull shape parameter
+  failure:    "first electrical open at corner ball"
+
+expected:
+  Nf_min:     5200       # 0.8 × eta — pass band lower bound
+  Nf_max:     7800       # 1.2 × eta — pass band upper bound
+  weakest_position: "corner"   # corner balls fail first (max DNP)
