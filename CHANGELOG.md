@@ -11,6 +11,17 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [0.1.3] — 2026-05-08
+
+### Fixed
+- **3D viewer crashed on startup with `Could not load potsdamer_platz_1k.hdr`.**
+  drei's `<Environment preset="city" />` fetches an HDR from
+  `raw.githubusercontent.com`, which the production CSP blocks (and would leak
+  usage data to GitHub anyway). Replaced with offline studio lighting:
+  ambient + 3 directional + hemisphere lights tuned for FR4/copper/solder.
+
+---
+
 ## [0.1.2] — 2026-05-08
 
 ### Fixed
