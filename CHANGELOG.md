@@ -11,6 +11,18 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [0.1.2] — 2026-05-08
+
+### Fixed
+- **3D viewer could not load GLB models in production builds.** CSP was missing
+  `connect-src` for the `asset:` / `http://asset.localhost` protocols, so
+  Three.js's `fetch()`-based GLTFLoader was blocked. Added `connect-src`,
+  `script-src 'wasm-unsafe-eval'` (for Draco decoder), and `worker-src blob:`
+  (for loader workers). Switched `assetProtocol.scope` to the Tauri 2
+  `{allow, deny}` object form.
+
+---
+
 ## [0.1.1] — 2026-05-06
 
 ### Fixed
