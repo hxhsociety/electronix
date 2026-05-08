@@ -1,0 +1,5 @@
+# VS Code Local History extension dumps timestamped backups here
+.history/
+
+# Generated artefacts (regenerate via `python ukbfg_cli.py ...`)
+*.kicad_mod
